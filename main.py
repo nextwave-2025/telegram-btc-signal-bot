@@ -15,10 +15,11 @@ from telegram import Bot
 # CONFIG
 # =========================
 
-DEBUG_LOGS = True
-SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "SUI/USDT", "DOGE/USDT"]
+DEBUG_LOGS = True  # prints to Railway logs
 
-ENTRY_TF = "15m"   # entry timeframe (Candle close only)
+SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "SUI/USDT"]  # add "DOGE/USDT" if you want
+
+ENTRY_TF = "15m"   # entry timeframe (candle close only)
 BIAS_TF = "4h"     # bias timeframe
 
 EMA_FAST = 20
@@ -29,30 +30,29 @@ RSI_LOWER = 34
 
 VOL_MA_LEN = 20
 
-SIGNAL_COOLDOWN_SECONDS = 60 * 30  # 30 min
-POLL_SECONDS = 30
+SIGNAL_COOLDOWN_SECONDS = 60 * 30  # 30 minutes per symbol
+POLL_SECONDS = 30                  # we poll often, but act only on NEW 15m candle
 
+# Exchange
 EXCHANGE_ID = "bybit"
-MARKET_TYPE = "linear"  # USDT Perps on Bybit
+MARKET_TYPE = "linear"  # USDT perps on Bybit via ccxt
 
-# --- Orderbook / Liquidity V3 ---
+# --- Liquidity Cluster V3 (Orderbook) ---
 ORDERBOOK_LIMIT = 200
-LIQ_LOOKAROUND_PCT = 0.008     # analyze +/-0.8% around mid
-LIQ_BIN_PCT = 0.0015           # cluster bin width ~0.15% of price
-LIQ_WALL_MULTIPLIER = 2.2      # wall if bin_size > avg_bin_size * multiplier
+LIQ_LOOKAROUND_PCT = 0.008     # +/- 0.8% around mid
+LIQ_BIN_PCT = 0.0015           # bin size ~0.15% of price
+LIQ_WALL_MULTIPLIER = 2.2      # wall if bin size > avg_bin * multiplier
 
-# Multiple snapshots to filter fake walls
+# Multi-snapshot fake wall filter
 OB_SNAPSHOTS = 3
 OB_SNAPSHOT_DELAY_SEC = 0.6
 WALL_PERSIST_MIN = 2           # wall must appear in >=2 snapshots
-WALL_PRICE_TOLERANCE_BINS = 1  # match walls across snapshots within +-1 bin
+WALL_PRICE_TOLERANCE_BINS = 1  # match walls across snapshots within +/-1 bin
 
 # Direction rules
-# LONG: need bids dominate + persistent bid wall BELOW near price
-# SHORT: need asks dominate + persistent ask wall ABOVE near price
-DOMINANCE_RATIO_NEAR_WALL = 1.15  # if near wall exists, dominance requirement is easier
-DOMINANCE_RATIO_NO_WALL = 1.40    # if no near wall, be stricter
-MAX_WALL_DISTANCE_PCT = 0.005     # near wall must be within 0.5% in the direction
+DOMINANCE_RATIO_NEAR_WALL = 1.15  # if near wall exists, allow with slightly weaker dominance
+DOMINANCE_RATIO_NO_WALL = 1.40    # if no near wall, require stronger dominance
+MAX_WALL_DISTANCE_PCT = 0.005     # wall considered "near" if within 0.5% from mid in direction
 TOP_WALLS_TO_REPORT = 3
 
 
@@ -83,7 +83,7 @@ def last_closed_candle_ts(df: pd.DataFrame) -> pd.Timestamp:
 
 
 # =========================
-# SIGNAL LOGIC (Core)
+# CORE SIGNAL LOGIC
 # =========================
 
 @dataclass
@@ -125,22 +125,12 @@ def check_entry(df_15m: pd.DataFrame, bias_dir: str) -> Tuple[bool, str, Dict]:
     info = {"close": c, "ema20": e20, "ema50": e50, "rsi": r, "vol": v, "volma": vma}
 
     if bias_dir == "LONG":
-        ok = (
-            c > e20 and
-            e20 > e50 and
-            (RSI_LOWER < r < RSI_UPPER) and
-            v > vma
-        )
+        ok = (c > e20) and (e20 > e50) and (RSI_LOWER < r < RSI_UPPER) and (v > vma)
         reason = "15m confirms LONG: close>EMA20, EMA20>EMA50, RSI 34-64, vol>MA"
         return ok, reason, info
 
     if bias_dir == "SHORT":
-        ok = (
-            c < e20 and
-            e20 < e50 and
-            (RSI_LOWER < r < RSI_UPPER) and
-            v > vma
-        )
+        ok = (c < e20) and (e20 < e50) and (RSI_LOWER < r < RSI_UPPER) and (v > vma)
         reason = "15m confirms SHORT: close<EMA20, EMA20<EMA50, RSI 34-64, vol>MA"
         return ok, reason, info
 
@@ -155,7 +145,7 @@ def check_entry(df_15m: pd.DataFrame, bias_dir: str) -> Tuple[bool, str, Dict]:
 class Wall:
     price: float
     size: float
-    distance_pct: float  # distance from mid in %
+    distance_pct: float
 
 @dataclass
 class LiquidityInfo:
@@ -164,22 +154,18 @@ class LiquidityInfo:
     liq_above: float
     dominance_below_over_above: float
     dominance_above_over_below: float
-    bid_walls_below: List[Wall]   # persistent walls below mid
-    ask_walls_above: List[Wall]   # persistent walls above mid
+    bid_walls_below: List[Wall]
+    ask_walls_above: List[Wall]
     has_near_bid_wall: bool
     has_near_ask_wall: bool
-    lookaround_pct: float
-    bin_pct: float
-    snapshots: int
-    wall_persist_min: int
-
-def _bin_size(mid: float) -> float:
-    return mid * LIQ_BIN_PCT
 
 def _bounds(mid: float) -> Tuple[float, float]:
     lo = mid * (1.0 - LIQ_LOOKAROUND_PCT)
     hi = mid * (1.0 + LIQ_LOOKAROUND_PCT)
     return lo, hi
+
+def _bin_size(mid: float) -> float:
+    return mid * LIQ_BIN_PCT
 
 def _bin_index(price: float, lo: float, bin_size: float) -> int:
     return int((price - lo) // bin_size)
@@ -197,64 +183,61 @@ def _bin_levels(levels, lo: float, hi: float, bin_size: float) -> Dict[int, floa
         bins[idx] = bins.get(idx, 0.0) + float(size)
     return bins
 
-def _sum_liquidity_in_band(bids, asks, mid: float, lo: float, hi: float) -> Tuple[float, float]:
-    liq_below = 0.0
-    for price, size in bids:
-        p = float(price)
-        if lo <= p < mid:
-            liq_below += float(size)
-
-    liq_above = 0.0
-    for price, size in asks:
-        p = float(price)
-        if mid < p <= hi:
-            liq_above += float(size)
-
-    return liq_below, liq_above
-
-def _extract_wall_bins(bins: Dict[int, float], wall_multiplier: float) -> List[Tuple[int, float]]:
+def _extract_wall_bins(bins: Dict[int, float]) -> List[Tuple[int, float]]:
     sizes = list(bins.values())
     if not sizes:
         return []
     avg = float(np.mean(sizes))
     if avg <= 0:
         return []
-    out = [(idx, float(sz)) for idx, sz in bins.items() if float(sz) >= avg * wall_multiplier]
+    out = [(idx, float(sz)) for idx, sz in bins.items() if float(sz) >= avg * LIQ_WALL_MULTIPLIER]
     out.sort(key=lambda x: x[1], reverse=True)
     return out
 
-def _merge_persistent_walls(wall_candidates_per_snapshot: List[List[Tuple[int, float]]]) -> Dict[int, float]:
-    """
-    Match walls across snapshots by bin index tolerance.
-    Returns: representative_bin_idx -> aggregated_size (max size observed)
-    """
-    persistent: Dict[int, Dict[str, float]] = {}  # idx -> {"count": c, "max": m}
-    for snapshot_walls in wall_candidates_per_snapshot:
-        used = set()
-        for idx, sz in snapshot_walls:
-            # try match existing within tolerance
-            match_idx = None
-            for existing_idx in persistent.keys():
-                if abs(existing_idx - idx) <= WALL_PRICE_TOLERANCE_BINS and existing_idx not in used:
-                    match_idx = existing_idx
-                    break
-            if match_idx is None:
-                persistent[idx] = {"count": 1.0, "max": float(sz)}
-                used.add(idx)
-            else:
-                persistent[match_idx]["count"] += 1.0
-                persistent[match_idx]["max"] = max(persistent[match_idx]["max"], float(sz))
-                used.add(match_idx)
+def _merge_persistent_walls(walls_per_snapshot: List[List[Tuple[int, float]]]) -> Dict[int, float]:
+    # idx -> {"count": int, "max": float}
+    track: Dict[int, Dict[str, float]] = {}
 
-    # filter by persistence
-    out: Dict[int, float] = {}
-    for idx, meta in persistent.items():
+    for snap_walls in walls_per_snapshot:
+        matched_this_snapshot = set()
+        for idx, sz in snap_walls:
+            match = None
+            for existing_idx in track.keys():
+                if abs(existing_idx - idx) <= WALL_PRICE_TOLERANCE_BINS and existing_idx not in matched_this_snapshot:
+                    match = existing_idx
+                    break
+
+            if match is None:
+                track[idx] = {"count": 1.0, "max": float(sz)}
+                matched_this_snapshot.add(idx)
+            else:
+                track[match]["count"] += 1.0
+                track[match]["max"] = max(track[match]["max"], float(sz))
+                matched_this_snapshot.add(match)
+
+    persistent: Dict[int, float] = {}
+    for idx, meta in track.items():
         if int(meta["count"]) >= WALL_PERSIST_MIN:
-            out[idx] = float(meta["max"])
-    return out
+            persistent[idx] = float(meta["max"])
+
+    return persistent
+
+def _sum_liquidity_band(bids, asks, mid: float, lo: float, hi: float) -> Tuple[float, float]:
+    below = 0.0
+    for price, size in bids:
+        p = float(price)
+        if lo <= p < mid:
+            below += float(size)
+
+    above = 0.0
+    for price, size in asks:
+        p = float(price)
+        if mid < p <= hi:
+            above += float(size)
+
+    return below, above
 
 def analyze_liquidity_v3(ex, symbol: str) -> LiquidityInfo:
-    # Take multiple snapshots to reduce fake walls
     snapshots = []
     for i in range(OB_SNAPSHOTS):
         ob = ex.fetch_order_book(symbol, limit=ORDERBOOK_LIMIT)
@@ -262,108 +245,99 @@ def analyze_liquidity_v3(ex, symbol: str) -> LiquidityInfo:
         asks = ob.get("asks", [])
         if not bids or not asks:
             raise RuntimeError("Empty orderbook")
+
         best_bid = float(bids[0][0])
         best_ask = float(asks[0][0])
         mid = (best_bid + best_ask) / 2.0
         snapshots.append((mid, bids, asks))
+
         if i < OB_SNAPSHOTS - 1:
             time.sleep(OB_SNAPSHOT_DELAY_SEC)
 
-    # Use last snapshot mid as reference
     mid, bids, asks = snapshots[-1]
     lo, hi = _bounds(mid)
-    bin_size = _bin_size(mid)
+    bs = _bin_size(mid)
 
-    # Total liquidity in band (last snapshot)
-    liq_below, liq_above = _sum_liquidity_in_band(bids, asks, mid, lo, hi)
-    dominance_ba = (liq_below / liq_above) if liq_above > 0 else float("inf")
-    dominance_ab = (liq_above / liq_below) if liq_below > 0 else float("inf")
+    liq_below, liq_above = _sum_liquidity_band(bids, asks, mid, lo, hi)
+    dom_ba = (liq_below / liq_above) if liq_above > 0 else float("inf")
+    dom_ab = (liq_above / liq_below) if liq_below > 0 else float("inf")
 
-    # Build bins & wall candidates per snapshot
-    bid_wall_candidates = []
-    ask_wall_candidates = []
-    for (m, b, a) in snapshots:
-        # keep same lo/hi/bin_size based on latest mid to avoid drift issues
-        bid_bins = _bin_levels(b, lo, hi, bin_size)
-        ask_bins = _bin_levels(a, lo, hi, bin_size)
+    bid_wall_candidates: List[List[Tuple[int, float]]] = []
+    ask_wall_candidates: List[List[Tuple[int, float]]] = []
 
-        bid_wall_candidates.append(_extract_wall_bins(bid_bins, LIQ_WALL_MULTIPLIER))
-        ask_wall_candidates.append(_extract_wall_bins(ask_bins, LIQ_WALL_MULTIPLIER))
+    for (_m, b, a) in snapshots:
+        bid_bins = _bin_levels(b, lo, hi, bs)
+        ask_bins = _bin_levels(a, lo, hi, bs)
+        bid_wall_candidates.append(_extract_wall_bins(bid_bins))
+        ask_wall_candidates.append(_extract_wall_bins(ask_bins))
 
     persistent_bid = _merge_persistent_walls(bid_wall_candidates)
     persistent_ask = _merge_persistent_walls(ask_wall_candidates)
 
-    # Convert persistent bins to walls with distance filters
     bid_walls_below: List[Wall] = []
     for idx, sz in persistent_bid.items():
-        price = _bin_center(idx, lo, bin_size)
+        price = _bin_center(idx, lo, bs)
         if price >= mid:
             continue
-        dist_pct = (mid - price) / mid
-        bid_walls_below.append(Wall(price=float(price), size=float(sz), distance_pct=float(dist_pct)))
+        dist = (mid - price) / mid
+        bid_walls_below.append(Wall(price=float(price), size=float(sz), distance_pct=float(dist)))
     bid_walls_below.sort(key=lambda w: w.size, reverse=True)
+    bid_walls_below = bid_walls_below[:TOP_WALLS_TO_REPORT]
 
     ask_walls_above: List[Wall] = []
     for idx, sz in persistent_ask.items():
-        price = _bin_center(idx, lo, bin_size)
+        price = _bin_center(idx, lo, bs)
         if price <= mid:
             continue
-        dist_pct = (price - mid) / mid
-        ask_walls_above.append(Wall(price=float(price), size=float(sz), distance_pct=float(dist_pct)))
+        dist = (price - mid) / mid
+        ask_walls_above.append(Wall(price=float(price), size=float(sz), distance_pct=float(dist)))
     ask_walls_above.sort(key=lambda w: w.size, reverse=True)
+    ask_walls_above = ask_walls_above[:TOP_WALLS_TO_REPORT]
 
-    has_near_bid_wall = any(w.distance_pct <= MAX_WALL_DISTANCE_PCT for w in bid_walls_below)
-    has_near_ask_wall = any(w.distance_pct <= MAX_WALL_DISTANCE_PCT for w in ask_walls_above)
+    has_near_bid = any(w.distance_pct <= MAX_WALL_DISTANCE_PCT for w in bid_walls_below)
+    has_near_ask = any(w.distance_pct <= MAX_WALL_DISTANCE_PCT for w in ask_walls_above)
 
     return LiquidityInfo(
         mid=float(mid),
         liq_below=float(liq_below),
         liq_above=float(liq_above),
-        dominance_below_over_above=float(dominance_ba),
-        dominance_above_over_below=float(dominance_ab),
-        bid_walls_below=bid_walls_below[:TOP_WALLS_TO_REPORT],
-        ask_walls_above=ask_walls_above[:TOP_WALLS_TO_REPORT],
-        has_near_bid_wall=has_near_bid_wall,
-        has_near_ask_wall=has_near_ask_wall,
-        lookaround_pct=LIQ_LOOKAROUND_PCT,
-        bin_pct=LIQ_BIN_PCT,
-        snapshots=OB_SNAPSHOTS,
-        wall_persist_min=WALL_PERSIST_MIN,
+        dominance_below_over_above=float(dom_ba),
+        dominance_above_over_below=float(dom_ab),
+        bid_walls_below=bid_walls_below,
+        ask_walls_above=ask_walls_above,
+        has_near_bid_wall=has_near_bid,
+        has_near_ask_wall=has_near_ask,
     )
 
 def liquidity_allows_v3(direction: str, liq: LiquidityInfo) -> Tuple[bool, str]:
     if direction == "LONG":
         required = DOMINANCE_RATIO_NEAR_WALL if liq.has_near_bid_wall else DOMINANCE_RATIO_NO_WALL
         if liq.dominance_below_over_above >= required:
-            if liq.has_near_bid_wall:
-                return True, f"Liquidity OK LONG: bids dominate {liq.dominance_below_over_above:.2f}x + near bid wall"
-            return True, f"Liquidity OK LONG: bids dominate {liq.dominance_below_over_above:.2f}x"
-        return False, f"Liquidity BLOCK LONG: bids/asks {liq.dominance_below_over_above:.2f}x (<{required}x)"
+            return True, f"Liquidity OK LONG: bids/asks={liq.dominance_below_over_above:.2f}x (req {required}x)"
+        return False, f"Liquidity BLOCK LONG: bids/asks={liq.dominance_below_over_above:.2f}x (<{required}x)"
 
     if direction == "SHORT":
         required = DOMINANCE_RATIO_NEAR_WALL if liq.has_near_ask_wall else DOMINANCE_RATIO_NO_WALL
         if liq.dominance_above_over_below >= required:
-            if liq.has_near_ask_wall:
-                return True, f"Liquidity OK SHORT: asks dominate {liq.dominance_above_over_below:.2f}x + near ask wall"
-            return True, f"Liquidity OK SHORT: asks dominate {liq.dominance_above_over_below:.2f}x"
-        return False, f"Liquidity BLOCK SHORT: asks/bids {liq.dominance_above_over_below:.2f}x (<{required}x)"
+            return True, f"Liquidity OK SHORT: asks/bids={liq.dominance_above_over_below:.2f}x (req {required}x)"
+        return False, f"Liquidity BLOCK SHORT: asks/bids={liq.dominance_above_over_below:.2f}x (<{required}x)"
 
     return False, "Liquidity: neutral direction"
 
 
 # =========================
-# TELEGRAM
+# TELEGRAM FORMATTING
 # =========================
 
-def _format_walls(walls: List[Wall], side_label: str) -> str:
+def _fmt_walls(label: str, walls: List[Wall]) -> str:
     if not walls:
-        return f"{side_label}: none\n"
-    lines = []
+        return f"{label}: none"
+    parts = []
     for w in walls:
-        lines.append(f"{w.price:.4f} ({w.size:.2f}, {w.distance_pct*100:.2f}%)")
-    return f"{side_label}: " + " | ".join(lines) + "\n"
+        parts.append(f"{w.price:.4f} ({w.size:.2f}, {w.distance_pct*100:.2f}%)")
+    return f"{label}: " + " | ".join(parts)
 
-def format_signal(symbol: str, direction: str, reason: str, info: Dict, bias: Bias, candle_ts: str,
+def format_signal(symbol: str, direction: str, candle_ts: str, bias: Bias, reason: str, info: Dict,
                   liq_reason: str, liq: LiquidityInfo) -> str:
     return (
         f"🚨 SIGNAL ({direction})\n\n"
@@ -376,13 +350,13 @@ def format_signal(symbol: str, direction: str, reason: str, info: Dict, bias: Bi
         f"📉 EMA{EMA_SLOW}: {info['ema50']:.4f}\n"
         f"📍 RSI(14): {info['rsi']:.2f} (Bands {RSI_LOWER}/{RSI_UPPER})\n"
         f"📦 Vol: {info['vol']:.2f} | VolMA({VOL_MA_LEN}): {info['volma']:.2f}\n\n"
-        f"🌊 Liquidity V3 (Bybit L2, ±{liq.lookaround_pct*100:.2f}%, snapshots={liq.snapshots}, persist≥{liq.wall_persist_min}):\n"
+        f"🌊 Liquidity V3 (Bybit L2, ±{LIQ_LOOKAROUND_PCT*100:.2f}%):\n"
         f"Below: {liq.liq_below:.2f} | Above: {liq.liq_above:.2f}\n"
-        f"{_format_walls(liq.bid_walls_below, '🧱 Bid walls below')}"
-        f"{_format_walls(liq.ask_walls_above, '🧱 Ask walls above')}"
-        f"✅ Liquidity: {liq_reason}\n\n"
+        f"{_fmt_walls('🧱 Bid walls below', liq.bid_walls_below)}\n"
+        f"{_fmt_walls('🧱 Ask walls above', liq.ask_walls_above)}\n"
+        f"✅ {liq_reason}\n\n"
         f"✅ Setup: {reason}\n"
-        f"⚠️ Hinweis: V3 (Fake-Wall Filter aktiv; News/SR folgen als nächster Schritt)"
+        f"⚠️ Hinweis: V3 (Liquidity Fake-Wall Filter aktiv; News/SR folgen)"
     )
 
 async def send_telegram(bot: Bot, chat_id: str, text: str) -> None:
@@ -402,7 +376,7 @@ def make_exchange():
 
 
 # =========================
-# MAIN LOOP
+# MAIN
 # =========================
 
 async def run():
@@ -418,94 +392,93 @@ async def run():
     last_seen_candle: Dict[str, pd.Timestamp] = {}
     last_signal_time: Dict[str, float] = {}
 
+    print("Bot booting…", flush=True)
     try:
-        await send_telegram(bot, chat_id, "✅ Signal-Bot gestartet (V3). 15m Close + 4h Bias + Liquidity V3 (Fake-Wall Filter) aktiv.")
+        await send_telegram(bot, chat_id, "✅ Signal-Bot gestartet (V3). 15m Close + 4h Bias + Liquidity V3 aktiv.")
+        print("Startup message sent ✅", flush=True)
     except Exception as e:
         print(f"Startup Telegram failed: {type(e).__name__}: {e}", flush=True)
 
-   while True:
-    try:
-        for symbol in SYMBOLS:
-            print(f"Checking {symbol}", flush=True)
-
-            ohlcv_15m = ex.fetch_ohlcv(symbol, timeframe=ENTRY_TF, limit=220)
-            ohlcv_4h = ex.fetch_ohlcv(symbol, timeframe=BIAS_TF, limit=220)
-
-            df15 = to_df(ohlcv_15m)
-            df4h = to_df(ohlcv_4h)
-
-            candle_ts = last_closed_candle_ts(df15)
-
-            if symbol in last_seen_candle and candle_ts == last_seen_candle[symbol]:
-                continue
-            last_seen_candle[symbol] = candle_ts
-
-            bias = compute_bias(df4h)
-            ok_entry, reason, info = check_entry(df15, bias.direction)
-
-            if DEBUG_LOGS:
-                print(
-                    f"[{symbol}] entry_ok={ok_entry} bias={bias.direction} "
-                    f"rsi={info['rsi']:.2f} "
-                    f"ema20={info['ema20']:.4f} ema50={info['ema50']:.4f} "
-                    f"vol={info['vol']:.2f} volma={info['volma']:.2f}",
-                    flush=True
-                )
-
-            if not (ok_entry and bias.direction in ("LONG", "SHORT")):
-                continue
-
-            now = time.time()
-            if now - last_signal_time.get(symbol, 0) < SIGNAL_COOLDOWN_SECONDS:
-                continue
-
-            liq = analyze_liquidity_v3(ex, symbol)
-
-            if DEBUG_LOGS:
-                print(
-                    f"[{symbol}] liq below={liq.liq_below:.2f} above={liq.liq_above:.2f} "
-                    f"dom_ba={liq.dominance_below_over_above:.2f}x "
-                    f"near_bid_wall={liq.has_near_bid_wall} "
-                    f"near_ask_wall={liq.has_near_ask_wall}",
-                    flush=True
-                )
-
-            ok_liq, liq_reason = liquidity_allows_v3(bias.direction, liq)
-            if not ok_liq:
-                print(f"[{symbol}] FILTERED: {liq_reason}", flush=True)
-                continue
-
-            text = format_signal(
-                symbol=symbol,
-                direction=bias.direction,
-                reason=reason,
-                info=info,
-                bias=bias,
-                candle_ts=str(candle_ts),
-                liq_reason=liq_reason,
-                liq=liq,
-            )
-            await send_telegram(bot, chat_id, text)
-            last_signal_time[symbol] = now
-
-    except Exception as e:
-        err = f"⚠️ Bot error: {type(e).__name__}: {e}"
-        print(err, flush=True)
+    while True:
         try:
-            await send_telegram(bot, chat_id, err)
-        except Exception:
-            pass
+            for symbol in SYMBOLS:
+                if DEBUG_LOGS:
+                    print(f"Checking {symbol}", flush=True)
 
-    await asyncio.sleep(POLL_SECONDS)
+                ohlcv_15m = ex.fetch_ohlcv(symbol, timeframe=ENTRY_TF, limit=220)
+                ohlcv_4h = ex.fetch_ohlcv(symbol, timeframe=BIAS_TF, limit=220)
 
+                df15 = to_df(ohlcv_15m)
+                df4h = to_df(ohlcv_4h)
 
+                candle_ts = last_closed_candle_ts(df15)
+
+                # Candle close only
+                if symbol in last_seen_candle and candle_ts == last_seen_candle[symbol]:
+                    continue
+                last_seen_candle[symbol] = candle_ts
+
+                bias = compute_bias(df4h)
+                ok_entry, reason, info = check_entry(df15, bias.direction)
+
+                if DEBUG_LOGS:
+                    print(
+                        f"[{symbol}] candle={candle_ts} bias={bias.direction} entry_ok={ok_entry} "
+                        f"close={info['close']:.4f} rsi={info['rsi']:.2f} "
+                        f"ema20={info['ema20']:.4f} ema50={info['ema50']:.4f} "
+                        f"vol={info['vol']:.2f} volma={info['volma']:.2f}",
+                        flush=True
+                    )
+
+                if not (ok_entry and bias.direction in ("LONG", "SHORT")):
+                    continue
+
+                now = time.time()
+                if now - last_signal_time.get(symbol, 0) < SIGNAL_COOLDOWN_SECONDS:
+                    if DEBUG_LOGS:
+                        print(f"[{symbol}] cooldown active, skipping", flush=True)
+                    continue
+
+                liq = analyze_liquidity_v3(ex, symbol)
+
+                if DEBUG_LOGS:
+                    print(
+                        f"[{symbol}] liq below={liq.liq_below:.2f} above={liq.liq_above:.2f} "
+                        f"dom_ba={liq.dominance_below_over_above:.2f}x "
+                        f"dom_ab={liq.dominance_above_over_below:.2f}x "
+                        f"near_bid_wall={liq.has_near_bid_wall} near_ask_wall={liq.has_near_ask_wall}",
+                        flush=True
+                    )
+
+                ok_liq, liq_reason = liquidity_allows_v3(bias.direction, liq)
+                if not ok_liq:
+                    if DEBUG_LOGS:
+                        print(f"[{symbol}] FILTERED: {liq_reason}", flush=True)
+                    continue
+
+                text = format_signal(
+                    symbol=symbol,
+                    direction=bias.direction,
+                    candle_ts=str(candle_ts),
+                    bias=bias,
+                    reason=reason,
+                    info=info,
+                    liq_reason=liq_reason,
+                    liq=liq,
+                )
+                await send_telegram(bot, chat_id, text)
+                last_signal_time[symbol] = now
+
+        except Exception as e:
+            err = f"⚠️ Bot error: {type(e).__name__}: {e}"
+            print(err, flush=True)
+            try:
+                await send_telegram(bot, chat_id, err)
+            except Exception:
+                pass
+
+        await asyncio.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
     asyncio.run(run())
-
-
-
-
-
-
