@@ -12,9 +12,14 @@ async def send_message(text: str):
     await bot.send_message(chat_id=CHAT_ID, text=text)
 
 def main():
-    asyncio.run(send_message("✅ Bot online. Schritt 1 erfolgreich. (Noch keine Signale)"))
+    try:
+        asyncio.run(send_message("✅ Bot online. Schritt 1 erfolgreich. (Noch keine Signale)"))
+    except Exception as e:
+        print(f"Startup send failed: {type(e).__name__}: {e}")
+
     while True:
         time.sleep(60)
 
 if __name__ == "__main__":
     main()
+
