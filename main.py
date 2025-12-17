@@ -423,7 +423,7 @@ async def run():
     except Exception as e:
         print(f"Startup Telegram failed: {type(e).__name__}: {e}", flush=True)
 
-    while True:
+   while True:
     try:
         for symbol in SYMBOLS:
             print(f"Checking {symbol}", flush=True)
@@ -436,7 +436,6 @@ async def run():
 
             candle_ts = last_closed_candle_ts(df15)
 
-            # Candle close only
             if symbol in last_seen_candle and candle_ts == last_seen_candle[symbol]:
                 continue
             last_seen_candle[symbol] = candle_ts
@@ -501,8 +500,10 @@ async def run():
 
 
 
+
 if __name__ == "__main__":
     asyncio.run(run())
+
 
 
 
