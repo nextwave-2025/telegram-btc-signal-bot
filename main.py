@@ -447,7 +447,8 @@ async def run():
             if DEBUG_LOGS:
                 print(
                     f"[{symbol}] entry_ok={ok_entry} bias={bias.direction} "
-                    f"rsi={info['rsi']:.2f} ema20={info['ema20']:.4f} ema50={info['ema50']:.4f} "
+                    f"rsi={info['rsi']:.2f} "
+                    f"ema20={info['ema20']:.4f} ema50={info['ema50']:.4f} "
                     f"vol={info['vol']:.2f} volma={info['volma']:.2f}",
                     flush=True
                 )
@@ -502,6 +503,7 @@ async def run():
 
 if __name__ == "__main__":
     asyncio.run(run())
+
 
 
 
