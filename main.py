@@ -2,24 +2,26 @@ import os
 import time
 import asyncio
 from telegram import Bot
+from telegram.error import BadRequest
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
 
 bot = Bot(token=BOT_TOKEN)
 
 async def send_message(text: str):
-    await bot.send_message(chat_id=CHAT_ID, text=text)
+    try:
+        await bot.send_message(chat_id=CHAT_ID, text=text)
+        print("Message sent successfully")
+    except BadRequest as e:
+        print(f"Telegram BadRequest: {e}")
+    except Exception as e:
+        print(f"Telegram Error: {type(e).__name__}: {e}")
 
 def main():
-    try:
-        asyncio.run(send_message("✅ Bot online. Schritt 1 erfolgreich. (Noch keine Signale)"))
-    except Exception as e:
-        print(f"Startup send failed: {type(e).__name__}: {e}")
-
+    print("Bot started. Waiting...")
     while True:
         time.sleep(60)
 
 if __name__ == "__main__":
     main()
-
