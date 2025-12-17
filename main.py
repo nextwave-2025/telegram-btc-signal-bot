@@ -16,7 +16,7 @@ from telegram import Bot
 
 DEBUG_LOGS = True
 
-SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "SUI/USDT", "DOGE/USDT", "XRP/USDT"]
+SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "SUI/USDT", "DOGE/USDT", "XRP/USDT", "HYPE/USDT", "FARTCOIN/USDT", "1000PEPE/USDT"]
 
 ENTRY_TF = "15m"   # candle close only
 BIAS_TF = "4h"     # bias + zones
@@ -709,6 +709,7 @@ async def run():
 
 if __name__ == "__main__":
     asyncio.run(run())
+
 
 
 
