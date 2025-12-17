@@ -431,80 +431,78 @@ async def run():
             ohlcv_15m = ex.fetch_ohlcv(symbol, timeframe=ENTRY_TF, limit=220)
             ohlcv_4h = ex.fetch_ohlcv(symbol, timeframe=BIAS_TF, limit=220)
 
+            df15 = to_df(ohlcv_15m)
+            df4h = to_df(ohlcv_4h)
 
-                df15 = to_df(ohlcv_15m)
-                df4h = to_df(ohlcv_4h)
+            candle_ts = last_closed_candle_ts(df15)
 
-                candle_ts = last_closed_candle_ts(df15)
+            # Candle close only
+            if symbol in last_seen_candle and candle_ts == last_seen_candle[symbol]:
+                continue
+            last_seen_candle[symbol] = candle_ts
 
-                # Candle close only
-                if symbol in last_seen_candle and candle_ts == last_seen_candle[symbol]:
-                    continue
-                last_seen_candle[symbol] = candle_ts
+            bias = compute_bias(df4h)
+            ok_entry, reason, info = check_entry(df15, bias.direction)
 
-                bias = compute_bias(df4h)
-                ok_entry, reason, info = check_entry(df15, bias.direction)
-                if DEBUG_LOGS:
-    print(
-        f"[{symbol}] 15m close={info['close']:.4f} | bias={bias.direction} | "
-        f"entry_ok={ok_entry} | rsi={info['rsi']:.2f} | "
-        f"ema20={info['ema20']:.4f} ema50={info['ema50']:.4f} | "
-        f"vol={info['vol']:.2f} volma={info['volma']:.2f}",
-        flush=True
-    )
-
-                if not (ok_entry and bias.direction in ("LONG", "SHORT")):
-                    continue
-
-                # Cooldown
-                now = time.time()
-                if now - last_signal_time.get(symbol, 0) < SIGNAL_COOLDOWN_SECONDS:
-                    continue
-
-                # Liquidity V3
-                liq = analyze_liquidity_v3(ex, symbol)
-
-if DEBUG_LOGS:
-    print(
-        f"[{symbol}] liq below={liq.liq_below:.2f} above={liq.liq_above:.2f} "
-        f"dom_ba={liq.dominance_below_over_above:.2f}x dom_ab={liq.dominance_above_over_below:.2f}x | "
-        f"near_bid_wall={liq.has_near_bid_wall} near_ask_wall={liq.has_near_ask_wall}",
-        flush=True
-    )
-
-ok_liq, liq_reason = liquidity_allows_v3(bias.direction, liq)
-if not ok_liq:
-    print(f"[{symbol}] FILTERED: {liq_reason}", flush=True)
-    continue
-
-
-
-                text = format_signal(
-                    symbol=symbol,
-                    direction=bias.direction,
-                    reason=reason,
-                    info=info,
-                    bias=bias,
-                    candle_ts=str(candle_ts),
-                    liq_reason=liq_reason,
-                    liq=liq,
+            if DEBUG_LOGS:
+                print(
+                    f"[{symbol}] entry_ok={ok_entry} bias={bias.direction} "
+                    f"rsi={info['rsi']:.2f} ema20={info['ema20']:.4f} ema50={info['ema50']:.4f} "
+                    f"vol={info['vol']:.2f} volma={info['volma']:.2f}",
+                    flush=True
                 )
-                await send_telegram(bot, chat_id, text)
-                last_signal_time[symbol] = now
 
-        except Exception as e:
-            err = f"⚠️ Bot error: {type(e).__name__}: {e}"
-            print(err, flush=True)
-            try:
-                await send_telegram(bot, chat_id, err)
-            except Exception:
-                pass
+            if not (ok_entry and bias.direction in ("LONG", "SHORT")):
+                continue
 
-        await asyncio.sleep(POLL_SECONDS)
+            now = time.time()
+            if now - last_signal_time.get(symbol, 0) < SIGNAL_COOLDOWN_SECONDS:
+                continue
+
+            liq = analyze_liquidity_v3(ex, symbol)
+
+            if DEBUG_LOGS:
+                print(
+                    f"[{symbol}] liq below={liq.liq_below:.2f} above={liq.liq_above:.2f} "
+                    f"dom_ba={liq.dominance_below_over_above:.2f}x "
+                    f"near_bid_wall={liq.has_near_bid_wall} "
+                    f"near_ask_wall={liq.has_near_ask_wall}",
+                    flush=True
+                )
+
+            ok_liq, liq_reason = liquidity_allows_v3(bias.direction, liq)
+            if not ok_liq:
+                print(f"[{symbol}] FILTERED: {liq_reason}", flush=True)
+                continue
+
+            text = format_signal(
+                symbol=symbol,
+                direction=bias.direction,
+                reason=reason,
+                info=info,
+                bias=bias,
+                candle_ts=str(candle_ts),
+                liq_reason=liq_reason,
+                liq=liq,
+            )
+            await send_telegram(bot, chat_id, text)
+            last_signal_time[symbol] = now
+
+    except Exception as e:
+        err = f"⚠️ Bot error: {type(e).__name__}: {e}"
+        print(err, flush=True)
+        try:
+            await send_telegram(bot, chat_id, err)
+        except Exception:
+            pass
+
+    await asyncio.sleep(POLL_SECONDS)
+
 
 
 if __name__ == "__main__":
     asyncio.run(run())
+
 
 
 
