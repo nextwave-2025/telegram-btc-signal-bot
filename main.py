@@ -460,11 +460,21 @@ async def run():
 
                 # Liquidity V3
                 liq = analyze_liquidity_v3(ex, symbol)
-                ok_liq, liq_reason = liquidity_allows_v3(bias.direction, liq)
-                if not ok_liq:
-                    # keep silent (no spam). Check logs if you want.
-                    print(f"[{symbol}] filtered: {liq_reason}", flush=True)
-                    continue
+
+if DEBUG_LOGS:
+    print(
+        f"[{symbol}] liq below={liq.liq_below:.2f} above={liq.liq_above:.2f} "
+        f"dom_ba={liq.dominance_below_over_above:.2f}x dom_ab={liq.dominance_above_over_below:.2f}x | "
+        f"near_bid_wall={liq.has_near_bid_wall} near_ask_wall={liq.has_near_ask_wall}",
+        flush=True
+    )
+
+ok_liq, liq_reason = liquidity_allows_v3(bias.direction, liq)
+if not ok_liq:
+    print(f"[{symbol}] FILTERED: {liq_reason}", flush=True)
+    continue
+
+
 
                 text = format_signal(
                     symbol=symbol,
@@ -492,4 +502,5 @@ async def run():
 
 if __name__ == "__main__":
     asyncio.run(run())
+
 
