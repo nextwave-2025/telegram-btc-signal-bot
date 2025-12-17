@@ -16,7 +16,7 @@ from telegram import Bot
 # =========================
 
 DEBUG_LOGS = True
-SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "SUI/USDT"]
+SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "SUI/USDT", "DOGE/USDT"]
 
 ENTRY_TF = "15m"   # entry timeframe (Candle close only)
 BIAS_TF = "4h"     # bias timeframe
@@ -424,10 +424,13 @@ async def run():
         print(f"Startup Telegram failed: {type(e).__name__}: {e}", flush=True)
 
     while True:
-        try:
-            for symbol in SYMBOLS:
-                ohlcv_15m = ex.fetch_ohlcv(symbol, timeframe=ENTRY_TF, limit=220)
-                ohlcv_4h = ex.fetch_ohlcv(symbol, timeframe=BIAS_TF, limit=220)
+    try:
+        for symbol in SYMBOLS:
+            print(f"Checking {symbol}", flush=True)
+
+            ohlcv_15m = ex.fetch_ohlcv(symbol, timeframe=ENTRY_TF, limit=220)
+            ohlcv_4h = ex.fetch_ohlcv(symbol, timeframe=BIAS_TF, limit=220)
+
 
                 df15 = to_df(ohlcv_15m)
                 df4h = to_df(ohlcv_4h)
@@ -502,5 +505,6 @@ if not ok_liq:
 
 if __name__ == "__main__":
     asyncio.run(run())
+
 
 
