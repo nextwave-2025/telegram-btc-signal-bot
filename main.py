@@ -118,13 +118,11 @@ def check_entry(df_15m: pd.DataFrame, bias_dir: str) -> Tuple[bool, str, Dict]:
     close = df_15m["close"]
     vol = df_15m["volume"]
 
-    # --- Indicators ---
     e20_series = ema(close, EMA_FAST)
     e50_series = ema(close, EMA_SLOW)
     rsi_series = rsi(close, 14)
     volma_series = vol.rolling(VOL_MA_LEN).mean()
 
-    # --- Latest values ---
     c = float(close.iloc[-1])
     e20 = float(e20_series.iloc[-1])
     e50 = float(e50_series.iloc[-1])
@@ -132,55 +130,32 @@ def check_entry(df_15m: pd.DataFrame, bias_dir: str) -> Tuple[bool, str, Dict]:
     v = float(vol.iloc[-1])
     vma = float(volma_series.iloc[-1]) if not np.isnan(volma_series.iloc[-1]) else float(np.mean(vol.tail(VOL_MA_LEN)))
 
-    # --- Volume logic (15m optimized) ---
-    VOL_RATIO = 0.50  # 🔧 0.45 = mehr Trades | 0.60 = strenger
+    # --- REALISTIC volume gate for your current vol/volma behavior ---
+    VOL_RATIO = 0.12  # 0.08 = mehr Trades | 0.15 = strenger
+    vol_ratio = (v / vma) if vma > 0 else 0.0
     vol_ok = v >= vma * VOL_RATIO
 
-    vol_ratio = (v / vma) if vma > 0 else 0.0
-
     info = {
-        "close": c,
-        "ema20": e20,
-        "ema50": e50,
-        "rsi": r,
-        "vol": v,
-        "volma": vma,
-        "vol_ratio": vol_ratio,
+        "close": c, "ema20": e20, "ema50": e50, "rsi": r,
+        "vol": v, "volma": vma, "vol_ratio": vol_ratio
     }
 
-    # --- LONG ---
+    # LONG: Trend up + RSI not overheated + volume ok
     if bias_dir == "LONG":
-        ok = (
-            c > e20 and
-            e20 > e50 and
-            (RSI_LOWER < r < RSI_UPPER) and
-            vol_ok
-        )
-
-        reason = (
-            "15m confirms LONG"
-            if ok else
-            f"LONG blocked (vol_ratio={vol_ratio:.2f}, rsi={r:.1f})"
-        )
+        rsi_ok = (r < RSI_UPPER)      # statt (34<r<64) -> weniger Blockaden
+        ok = (c > e20) and (e20 > e50) and rsi_ok and vol_ok
+        reason = "15m confirms LONG" if ok else f"LONG blocked (rsi_ok={rsi_ok}, vol_ratio={vol_ratio:.2f})"
         return ok, reason, info
 
-    # --- SHORT ---
+    # SHORT: Trend down + RSI not oversold + volume ok
     if bias_dir == "SHORT":
-        ok = (
-            c < e20 and
-            e20 < e50 and
-            (RSI_LOWER < r < RSI_UPPER) and
-            vol_ok
-        )
-
-        reason = (
-            "15m confirms SHORT"
-            if ok else
-            f"SHORT blocked (vol_ratio={vol_ratio:.2f}, rsi={r:.1f})"
-        )
+        rsi_ok = (r > RSI_LOWER)      # statt (34<r<64) -> BTC/SOL blocken nicht mehr wegen RSI>64
+        ok = (c < e20) and (e20 < e50) and rsi_ok and vol_ok
+        reason = "15m confirms SHORT" if ok else f"SHORT blocked (rsi_ok={rsi_ok}, vol_ratio={vol_ratio:.2f})"
         return ok, reason, info
 
     return False, "Bias neutral", info
+
 
 
 
@@ -597,7 +572,7 @@ async def run():
                     print(
                         f"[{symbol}] candle={candle_ts} bias={bias.direction} entry_ok={ok_entry} "
                         f"close={info['close']:.4f} rsi={info['rsi']:.2f} "
-                        f"vol={info['vol']:.2f} volma={info['volma']:.2f} "
+                        f"vol={info['vol']:.2f} volma={info['volma']:.2f} vol_ratio={info.get('vol_ratio', 0):.2f} "
                         f"sup={_zone_line(sup)} res={_zone_line(res)}",
                         flush=True
                     )
@@ -734,5 +709,6 @@ async def run():
 
 if __name__ == "__main__":
     asyncio.run(run())
+
 
 
