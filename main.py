@@ -1,29 +1,26 @@
-import os
-import time
-import asyncio
 from telegram import Bot
-from telegram.error import BadRequest, Forbidden
+import os
+import asyncio
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-bot = Bot(token=BOT_TOKEN)
+async def send_demo_signal():
+    bot = Bot(token=BOT_TOKEN)
 
-async def send_message(text: str):
-    await bot.send_message(chat_id=CHAT_ID, text=text)
+    message = (
+        "🚨 DEMO SIGNAL 🚨\n\n"
+        "📊 Pair: BTCUSDT\n"
+        "📈 Direction: LONG\n"
+        "🎯 Entry: 42,500\n"
+        "🛑 Stop Loss: 41,900\n"
+        "💰 Targets:\n"
+        "TP1: 43,200\n"
+        "TP2: 44,000\n\n"
+        "⚠️ Demo-Signal – keine Anlageberatung"
+    )
 
-def main():
-    try:
-        asyncio.run(send_message("✅ Bot online. Schritt 1 erfolgreich. (Noch keine Signale)"))
-        print("Startup message sent.")
-    except (BadRequest, Forbidden) as e:
-        # z.B. Chat not found / fehlende Rechte
-        print(f"Startup send failed: {type(e).__name__}: {e}")
-    except Exception as e:
-        print(f"Unexpected error: {type(e).__name__}: {e}")
-
-    while True:
-        time.sleep(60)
+    await bot.send_message(chat_id=CHAT_ID, text=message)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(send_demo_signal())
