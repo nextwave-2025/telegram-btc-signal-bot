@@ -441,10 +441,16 @@ def main():
             for symbol in symbols_ok:
                 print(f"Checking {symbol.replace(':USDT','')}", flush=True)
 
-                df15 = fetch_ohlcv_df(exchange, symbol, TIMEFRAME_ENTRY, limit=300)
-                df4h = fetch_ohlcv_df(exchange, symbol, TIMEFRAME_BIAS, limit=300)
+                df15_raw = fetch_ohlcv_df(exchange, symbol, TIMEFRAME_ENTRY, limit=300)
+df4h = fetch_ohlcv_df(exchange, symbol, TIMEFRAME_BIAS, limit=300)
 
-                candle_ts = df15.index[-1]  # UTC timestamp
+# ✅ WICHTIG: letzte GESCHLOSSENE 15m-Candle verwenden
+if len(df15_raw) < 3:
+    continue
+
+df15 = df15_raw.iloc[:-1].copy()   # entfernt die aktuell offene Candle
+candle_ts = df15.index[-1]         # jetzt garantiert CLOSED candle
+
 
                 # Candle close only
                 if symbol in last_seen_candle and candle_ts == last_seen_candle[symbol]:
@@ -508,3 +514,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
