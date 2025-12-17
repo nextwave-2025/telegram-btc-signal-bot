@@ -243,7 +243,8 @@ def build_signal_message(symbol: str, candle_ts, side: str, info: Dict) -> str:
         f"✅ TP2: {plan['tp2']:.4f}\n"
         f"✅ TP3: {plan['tp3']:.4f}\n"
         f"📌 CRV (TP2): {plan['crv']}\n\n"
-        f"⚠️ Automatisches Signal (kein Financial Advice)"
+        f"⚠️ Automatisches Signal (kein Financial Advice) - Kryptowährungen können volatil sein! Bitte überprüfe zusätzlich den jeweiligen Chart bevor du tradest."
+        f"©️ Copyright by **crypto_mistik.** Der Einsatz dieses Bots oder von Teilen davon ohne vorherige Zustimmung des Channel-Betreibers ist untersagt. Zuwiderhandlungen können zivil- und strafrechtlich verfolgt werden."
     )
     return msg
 
@@ -331,3 +332,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
