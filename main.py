@@ -15,6 +15,7 @@ from telegram import Bot
 # CONFIG
 # =========================
 
+DEBUG_LOGS = True
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "SUI/USDT"]
 
 ENTRY_TF = "15m"   # entry timeframe (Candle close only)
@@ -440,6 +441,14 @@ async def run():
 
                 bias = compute_bias(df4h)
                 ok_entry, reason, info = check_entry(df15, bias.direction)
+                if DEBUG_LOGS:
+    print(
+        f"[{symbol}] 15m close={info['close']:.4f} | bias={bias.direction} | "
+        f"entry_ok={ok_entry} | rsi={info['rsi']:.2f} | "
+        f"ema20={info['ema20']:.4f} ema50={info['ema50']:.4f} | "
+        f"vol={info['vol']:.2f} volma={info['volma']:.2f}",
+        flush=True
+    )
 
                 if not (ok_entry and bias.direction in ("LONG", "SHORT")):
                     continue
@@ -483,3 +492,4 @@ async def run():
 
 if __name__ == "__main__":
     asyncio.run(run())
+
