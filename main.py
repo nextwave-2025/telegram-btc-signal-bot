@@ -19,24 +19,31 @@ from zoneinfo import ZoneInfo
 TIMEFRAME_ENTRY = "15m"
 TIMEFRAME_BIAS_1H = "1h"
 TIMEFRAME_BIAS_4H = "4h"
+TIMEFRAME_DAILY = "1d"
 LOCAL_TZ = "Europe/Berlin"
 
 EMA_FAST = 20
 EMA_SLOW = 50
 RSI_LEN = 14
 
-# RSI tuning (more realistic)
+# RSI tuning
 RSI_SHORT_MIN = 42.0
-RSI_LONG_MAX = 62.0  # slightly relaxed
+RSI_LONG_MAX = 62.0
+
+# Reversal thresholds (countertrend LONG when market is truly oversold on higher TF)
+REV_RSI_15M_MAX = 30.0
+REV_RSI_4H_MAX  = 35.0
+REV_RSI_1D_MAX  = 45.0
+REVERSAL_MODE = True
 
 # Volume tuning
 VOL_MA_LEN = 20
-VOL_RATIO_BASE = 0.10           # mild baseline
-VOL_RATIO_BREAK_OVERRIDE = 1.0  # if RSI is low, require strong vol on breakdown
+VOL_RATIO_BASE = 0.10
+VOL_RATIO_BREAK_OVERRIDE = 1.0
 
 ATR_LEN = 14
 ATR_MULT = 1.5
-MAX_SL_PCT = 0.02  # max 2%
+MAX_SL_PCT = 0.02
 
 ENTRY_PAD_PCT = 0.0006
 RR_TARGETS = (1, 2, 3)
@@ -44,13 +51,13 @@ RR_TARGETS = (1, 2, 3)
 # Fakeout rules
 FAKEOUT_ENABLED = True
 
-# Pivot zone building (better than min/max)
+# Pivot zone building
 PIVOT_LOOKBACK_4H = 140
 PIVOT_LEFT = 2
 PIVOT_RIGHT = 2
-ZONE_PAD_PCT = 0.0012  # zone thickness around pivot
+ZONE_PAD_PCT = 0.0012
 
-# Telegram ENV (supports both naming styles)
+# Telegram ENV
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID") or "").strip()
 
@@ -92,6 +99,7 @@ class Pending:
     symbol: str
     side: str                 # "LONG" / "SHORT"
     stage: str                # "WAIT_CONFIRM" -> "WAIT_PULLBACK" -> "WAIT_ENTRY"
+    tag: str                  # "TREND" or "REVERSAL"
 
     breakout_ts: pd.Timestamp
     breakout_high: float
@@ -106,7 +114,10 @@ class Pending:
     pullback_ts: Optional[pd.Timestamp] = None
     entry_open_ts: Optional[pd.Timestamp] = None
 
-    rsi: float = 0.0
+    rsi_15m: float = 0.0
+    rsi_4h: float = 0.0
+    rsi_1d: float = 0.0
+
     ema20: float = 0.0
     ema50: float = 0.0
     volma: float = 0.0
@@ -135,9 +146,6 @@ def _tg_post(method: str, payload: Dict) -> Dict:
         return {"ok": False, "raw": body}
 
 def send_telegram_html(text: str) -> Optional[int]:
-    """
-    Sends message and returns message_id if successful.
-    """
     if not telegram_enabled():
         print("⚠️ Telegram OFF (BOT_TOKEN/CHAT_ID missing)", flush=True)
         return None
@@ -152,24 +160,18 @@ def send_telegram_html(text: str) -> Optional[int]:
         if not res.get("ok"):
             print(f"⚠️ Telegram send failed: {str(res)[:800]}", flush=True)
             return None
-        msg_id = res["result"]["message_id"]
-        return int(msg_id)
+        return int(res["result"]["message_id"])
     except Exception as e:
         print(f"⚠️ Telegram error: {type(e).__name__}: {e}", flush=True)
         return None
 
 def delete_telegram_message(message_id: int) -> bool:
-    """
-    Deletes one message. Only bot messages will be in our list anyway.
-    Might require admin rights in groups/channels.
-    """
     if not telegram_enabled():
         return False
     try:
         res = _tg_post("deleteMessage", {"chat_id": CHAT_ID, "message_id": int(message_id)})
         ok = bool(res.get("ok"))
         if not ok:
-            # common if bot has no rights; keep log short
             print(f"⚠️ deleteMessage failed (id={message_id}): {str(res)[:300]}", flush=True)
         return ok
     except Exception as e:
@@ -208,26 +210,19 @@ def maybe_send_scheduled_alerts(state: Dict[str, str], sent_ids: List[int]):
         state["us_closing"] = day
 
 def maybe_midnight_cleanup(state: Dict[str, str], sent_ids: List[int]):
-    """
-    At 00:00 local time, delete all bot-sent messages we tracked.
-    This will NOT touch user posts, because we only store bot message_ids.
-    Runs once per day.
-    """
     now = local_now()
     hhmm = now.strftime("%H:%M")
     day = today_key(now)
 
     if hhmm != DELETE_BOT_MESSAGES_AT:
         return
-
     if state.get("midnight_cleanup") == day:
-        return  # already done today
+        return
 
     if not sent_ids:
         state["midnight_cleanup"] = day
         return
 
-    # try delete all; keep list of those not deleted (e.g., no permissions)
     remaining = []
     deleted = 0
     for mid in list(sent_ids):
@@ -346,8 +341,8 @@ def is_break_event(side: str, close: float, sup: Optional[Zone], res: Optional[Z
             return False, "No support zone"
         return (close < sup.low), f"Breakdown (close<{sup.low:.4f})"
 
-def entry_filters(side: str, c: float, e20v: float, e50v: float, r: float, v: float, vma: float,
-                  break_event: bool) -> Tuple[bool, str]:
+def entry_filters_trend(side: str, c: float, e20v: float, e50v: float, r15: float, v: float, vma: float,
+                       break_event: bool) -> Tuple[bool, str]:
     vol_ok = (vma > 0) and (v >= vma * VOL_RATIO_BASE)
 
     if side == "SHORT":
@@ -358,9 +353,9 @@ def entry_filters(side: str, c: float, e20v: float, e50v: float, r: float, v: fl
         if not (below_fast or in_pullback_band):
             return False, "Price not in SHORT zone (below e20 or between e20/e50)"
 
-        if r < RSI_SHORT_MIN:
+        if r15 < RSI_SHORT_MIN:
             if not break_event:
-                return False, f"RSI too low for SHORT ({r:.2f} < {RSI_SHORT_MIN})"
+                return False, f"RSI too low for SHORT ({r15:.2f} < {RSI_SHORT_MIN})"
             if not (vma > 0 and v >= vma * VOL_RATIO_BREAK_OVERRIDE):
                 return False, f"RSI low; need strong vol for breakdown (vol<{VOL_RATIO_BREAK_OVERRIDE}x vma)"
 
@@ -375,13 +370,21 @@ def entry_filters(side: str, c: float, e20v: float, e50v: float, r: float, v: fl
         above_fast = c > e20v
         if not (above_fast or in_pullback_band):
             return False, "Price not in LONG zone (above e20 or between e20/e50)"
-        if r > RSI_LONG_MAX:
-            return False, f"RSI too high for LONG ({r:.2f} > {RSI_LONG_MAX})"
+
+        if r15 > RSI_LONG_MAX:
+            return False, f"RSI too high for LONG ({r15:.2f} > {RSI_LONG_MAX})"
         if not vol_ok:
             return False, "Volume too low"
         return True, "OK"
 
     return False, "Invalid side"
+
+def reversal_long_allowed(bias4h: str, r15: float, r4h: float, r1d: float) -> bool:
+    if not REVERSAL_MODE:
+        return False
+    if bias4h != "SHORT":
+        return False
+    return (r15 <= REV_RSI_15M_MAX) and (r4h <= REV_RSI_4H_MAX) and (r1d <= REV_RSI_1D_MAX)
 
 def entry_range_from_price(px: float) -> Tuple[float, float]:
     low = px * (1 - ENTRY_PAD_PCT)
@@ -474,7 +477,7 @@ def build_entry_html(p: Pending, entry_price: float, entry_open_ts: pd.Timestamp
     t3 = to_local(entry_open_ts)
 
     return (
-        f"{head} <b>ENTRY</b> (Fakeout-Filter ✅)\n\n"
+        f"{head} <b>ENTRY</b> ({p.tag} | Fakeout-Filter ✅)\n\n"
         f"📊 <b>Pair:</b> {pair}\n"
         f"🕒 <b>t0 Break Close:</b> {t0}\n"
         f"✅ <b>t1 Confirm Close:</b> {t1}\n"
@@ -487,7 +490,7 @@ def build_entry_html(p: Pending, entry_price: float, entry_open_ts: pd.Timestamp
         f"✅ <b>TP2:</b> {plan['tp2']:.6f}\n"
         f"✅ <b>TP3:</b> {plan['tp3']:.6f}\n"
         f"📌 <b>CRV (TP2):</b> {plan['crv']}\n\n"
-        f"📍 <b>RSI({RSI_LEN}):</b> {p.rsi:.2f}\n"
+        f"📍 <b>RSI:</b> 15m={p.rsi_15m:.2f} | 4h={p.rsi_4h:.2f} | 1d={p.rsi_1d:.2f}\n"
         f"📈 <b>Bias:</b> 1h={p.bias_1h} | 4h={p.bias_4h} (master)\n\n"
         f"🧱 <b>4h Zones:</b>\n"
         f"Support: {fmt_zone(p.sup)}\n"
@@ -508,19 +511,16 @@ def main():
     markets = ex.load_markets()
     symbols = [s for s in symbols if s in markets and markets[s].get("active", True)]
 
-    print(f"✅ BOT AKTIV – Fakeout-Regeln ON | Telegram={'ON' if telegram_enabled() else 'OFF'}", flush=True)
+    print(f"✅ BOT AKTIV – Fakeout-Regeln ON | Reversal={'ON' if REVERSAL_MODE else 'OFF'} | Telegram={'ON' if telegram_enabled() else 'OFF'}", flush=True)
     print(f"✅ Symbols: {symbols}", flush=True)
 
     last_processed_close: Dict[str, pd.Timestamp] = {}
     pending: Dict[str, Pending] = {}
     alert_state: Dict[str, str] = {}
-
-    # store only bot-sent message_ids (signals + alerts)
     sent_bot_message_ids: List[int] = []
 
     while True:
         try:
-            # scheduled alerts + midnight delete
             maybe_send_scheduled_alerts(alert_state, sent_bot_message_ids)
             maybe_midnight_cleanup(alert_state, sent_bot_message_ids)
 
@@ -528,8 +528,9 @@ def main():
                 df15_raw = fetch_df(ex, symbol, TIMEFRAME_ENTRY, limit=300)
                 df1h = fetch_df(ex, symbol, TIMEFRAME_BIAS_1H, limit=300)
                 df4h = fetch_df(ex, symbol, TIMEFRAME_BIAS_4H, limit=300)
+                df1d = fetch_df(ex, symbol, TIMEFRAME_DAILY, limit=220)
 
-                if len(df15_raw) < 50 or len(df4h) < 80:
+                if len(df15_raw) < 50 or len(df4h) < 80 or len(df1d) < 40:
                     continue
 
                 ts_open = df15_raw.index[-1]
@@ -543,7 +544,7 @@ def main():
                         confirm_close = float(df15_raw["close"].iloc[-2])
                         ok_confirm = (not FAKEOUT_ENABLED) or confirm_rule2(p.side, p.breakout_high, p.breakout_low, confirm_close)
                         if not ok_confirm:
-                            print(f"[{symbol}] Rule2 FAIL confirm_close={confirm_close:.6f}", flush=True)
+                            print(f"[{symbol}] Rule2 FAIL confirm_close={confirm_close:.6f} tag={p.tag}", flush=True)
                             del pending[symbol]
                         else:
                             p.stage = "WAIT_PULLBACK"
@@ -561,10 +562,10 @@ def main():
                             ok_vol = (not FAKEOUT_ENABLED) or pullback_rule1_volume(pull_vol, p2.breakout_vol)
 
                             if not ok_pull:
-                                print(f"[{symbol}] Pullback FAIL low/high={pull_low:.6f}/{pull_high:.6f}", flush=True)
+                                print(f"[{symbol}] Pullback FAIL tag={p2.tag}", flush=True)
                                 del pending[symbol]
                             elif not ok_vol:
-                                print(f"[{symbol}] Rule1 FAIL pull_vol>{p2.breakout_vol:.2f}", flush=True)
+                                print(f"[{symbol}] Rule1 FAIL pull_vol>{p2.breakout_vol:.2f} tag={p2.tag}", flush=True)
                                 del pending[symbol]
                             else:
                                 p2.stage = "WAIT_ENTRY"
@@ -583,10 +584,10 @@ def main():
                             invalid = (open_price >= sl) if p3.side.upper() == "SHORT" else (open_price <= sl)
 
                             if invalid:
-                                print(f"[{symbol}] Entry invalid at open (open={open_price:.6f}, sl={sl:.6f})", flush=True)
+                                print(f"[{symbol}] Entry invalid at open tag={p3.tag}", flush=True)
                                 del pending[symbol]
                             elif not in_range:
-                                print(f"[{symbol}] Entry open not in range (open={open_price:.6f})", flush=True)
+                                print(f"[{symbol}] Entry open not in range tag={p3.tag}", flush=True)
                                 del pending[symbol]
                             else:
                                 msg = build_entry_html(p3, entry_price=open_price, entry_open_ts=ts_open)
@@ -606,7 +607,10 @@ def main():
                 c = float(df15_closed["close"].iloc[-1])
                 v = float(df15_closed["volume"].iloc[-1])
                 vma = float(df15_closed["volume"].rolling(VOL_MA_LEN).mean().iloc[-1])
-                r = float(rsi(df15_closed["close"], RSI_LEN).iloc[-1])
+                r15 = float(rsi(df15_closed["close"], RSI_LEN).iloc[-1])
+
+                r4h = float(rsi(df4h["close"], RSI_LEN).iloc[-1])
+                r1d = float(rsi(df1d["close"], RSI_LEN).iloc[-1])
 
                 e20v = float(ema(df15_closed["close"], EMA_FAST).iloc[-1])
                 e50v = float(ema(df15_closed["close"], EMA_SLOW).iloc[-1])
@@ -618,50 +622,61 @@ def main():
                 b4h = compute_bias(df4h)
                 bias = combine_bias(b1h, b4h)
 
-                if bias.direction == "NEUTRAL":
-                    print(f"[{symbol}] close={ts_close} bias=NEUTRAL (1h={b1h.direction},4h={b4h.direction})", flush=True)
-                    continue
-
                 sup, res = best_pivot_zones_4h(df4h, current_price=c)
-                break_ok, break_reason = is_break_event(bias.direction, c, sup, res)
 
-                ok, why = entry_filters(bias.direction, c, e20v, e50v, r, v, vma, break_event=break_ok)
-                if not ok:
-                    print(f"[{symbol}] close={ts_close} bias={bias.direction} setup=NO ({why}) rsi={r:.2f}", flush=True)
-                    continue
+                # --- TREND setup (bias direction) ---
+                if bias.direction in ("LONG", "SHORT"):
+                    break_ok, break_reason = is_break_event(bias.direction, c, sup, res)
+                    ok, why = entry_filters_trend(bias.direction, c, e20v, e50v, r15, v, vma, break_ok)
 
-                if not break_ok:
-                    print(f"[{symbol}] close={ts_close} bias={bias.direction} break=NO ({break_reason})", flush=True)
-                    continue
+                    if not ok:
+                        print(f"[{symbol}] close={ts_close} bias={bias.direction} setup=NO ({why}) rsi15={r15:.2f}", flush=True)
+                    elif not break_ok:
+                        print(f"[{symbol}] close={ts_close} bias={bias.direction} break=NO ({break_reason})", flush=True)
+                    else:
+                        if symbol not in pending:
+                            row = df15_raw.iloc[-2]
+                            pending[symbol] = Pending(
+                                symbol=symbol, side=bias.direction, stage="WAIT_CONFIRM", tag="TREND",
+                                breakout_ts=ts_close,
+                                breakout_high=float(row["high"]), breakout_low=float(row["low"]),
+                                breakout_close=float(row["close"]), breakout_vol=float(row["volume"]),
+                                sup=sup, res=res, confirm_ts=ts_open,
+                                rsi_15m=r15, rsi_4h=r4h, rsi_1d=r1d,
+                                ema20=e20v, ema50=e50v, volma=vma, atr=atrv,
+                                bias_1h=b1h.direction, bias_4h=b4h.direction
+                            )
+                            print(f"[{symbol}] ✅ Pending TREND created: {bias.direction} | {break_reason} | wait CONFIRM at {ts_open}", flush=True)
 
-                row = df15_raw.iloc[-2]  # breakout candle
-                b_high = float(row["high"])
-                b_low = float(row["low"])
-                b_close = float(row["close"])
-                b_vol = float(row["volume"])
-
-                if symbol not in pending:
-                    pending[symbol] = Pending(
-                        symbol=symbol,
-                        side=bias.direction,
-                        stage="WAIT_CONFIRM",
-                        breakout_ts=ts_close,
-                        breakout_high=b_high,
-                        breakout_low=b_low,
-                        breakout_close=b_close,
-                        breakout_vol=b_vol,
-                        sup=sup,
-                        res=res,
-                        confirm_ts=ts_open,
-                        rsi=r,
-                        ema20=e20v,
-                        ema50=e50v,
-                        volma=vma,
-                        atr=atrv,
-                        bias_1h=b1h.direction,
-                        bias_4h=b4h.direction,
-                    )
-                    print(f"[{symbol}] ✅ Pending created: {bias.direction} | {break_reason} | wait CONFIRM at {ts_open}", flush=True)
+                # --- REVERSAL setup (countertrend LONG in oversold) ---
+                # Only if no pending exists already (avoid stacking)
+                if REVERSAL_MODE and symbol not in pending:
+                    if reversal_long_allowed(b4h.direction, r15, r4h, r1d):
+                        # For reversal LONG we require breakout ABOVE resistance (structure break)
+                        break_ok, break_reason = is_break_event("LONG", c, sup, res)
+                        if break_ok:
+                            row = df15_raw.iloc[-2]
+                            pending[symbol] = Pending(
+                                symbol=symbol, side="LONG", stage="WAIT_CONFIRM", tag="REVERSAL",
+                                breakout_ts=ts_close,
+                                breakout_high=float(row["high"]), breakout_low=float(row["low"]),
+                                breakout_close=float(row["close"]), breakout_vol=float(row["volume"]),
+                                sup=sup, res=res, confirm_ts=ts_open,
+                                rsi_15m=r15, rsi_4h=r4h, rsi_1d=r1d,
+                                ema20=e20v, ema50=e50v, volma=vma, atr=atrv,
+                                bias_1h=b1h.direction, bias_4h=b4h.direction
+                            )
+                            print(
+                                f"[{symbol}] ✅ Pending REVERSAL created: LONG | {break_reason} | "
+                                f"rsi15={r15:.2f} rsi4h={r4h:.2f} rsi1d={r1d:.2f}",
+                                flush=True
+                            )
+                        else:
+                            print(
+                                f"[{symbol}] REVERSAL watch: oversold confirmed (rsi15={r15:.2f}, rsi4h={r4h:.2f}, rsi1d={r1d:.2f}) "
+                                f"but no LONG break yet",
+                                flush=True
+                            )
 
             time.sleep(5)
 
