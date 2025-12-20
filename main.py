@@ -27,14 +27,21 @@ EMA_FAST = 20
 EMA_SLOW = 50
 RSI_LEN = 14
 
-# QUALITY MODE
+# QUALITY
 QUALITY_LONG_NEEDS_RSI50_CROSS = True  # 15m RSI must cross above 50 for LONG
 
 # RSI filters
 RSI_SHORT_MIN = 42.0     # blocks late shorts (oversold protection)
-RSI_LONG_MAX = 72.0      # not used when cross enabled; kept as fallback
+RSI_LONG_MAX = 72.0
+
+# “Resume” thresholds (used only in strict resume)
 RESUME_SHORT_MAX_RSI = 60.0
 RESUME_LONG_MIN_RSI = 40.0
+
+# NEW: Micro-trend mode (fixes your logs)
+MICRO_TREND_ENABLED = True
+# SHORT micro trend = close < EMA20 and EMA20 slope down
+# LONG  micro trend = close > EMA20 and EMA20 slope up
 
 # Reversal mode (optional watch)
 REVERSAL_MODE = True
@@ -54,20 +61,19 @@ MAX_SL_PCT = 0.02
 ENTRY_PAD_PCT = 0.0006
 RR_TARGETS = (1, 2, 3)
 
-# Fakeout rules
+# Fakeout rules (3 rules)
 FAKEOUT_ENABLED = True
 
-# Pivot zones settings (1h trigger zones + 4h map zones)
+# Pivot zones settings
 PIV_LEFT = 2
 PIV_RIGHT = 2
 
 LOOKBACK_1H = 180
-ZONE_PAD_PCT_1H = 0.0010   # tighter, for trigger precision
+ZONE_PAD_PCT_1H = 0.0010
 
 LOOKBACK_4H = 140
-ZONE_PAD_PCT_4H = 0.0012   # wider, for map/TP context
+ZONE_PAD_PCT_4H = 0.0012
 
-# EMA slope checks (to detect "resume")
 EMA_SLOPE_LEN = 5
 
 # Telegram env (supports both naming styles)
@@ -78,7 +84,7 @@ CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID") or "").strip()
 ALERT_US_OPENING_TIME = "15:15"
 ALERT_US_CLOSING_TIME = "21:45"
 
-# Midnight cleanup
+# Midnight cleanup (delete bot messages)
 DELETE_BOT_MESSAGES_AT = "00:00"
 
 # Rate limit protection
@@ -340,7 +346,7 @@ def best_pivot_zones(df: pd.DataFrame, current_price: float, lookback: int, pad_
 
 
 # =========================
-# STRATEGY
+# STRATEGY CORE
 # =========================
 
 def compute_bias(df: pd.DataFrame) -> Bias:
@@ -370,7 +376,7 @@ def fetch_df(exchange: ccxt.Exchange, symbol: str, tf: str, limit: int = 300) ->
     return df
 
 def is_break_event(side: str, close: float, sup: Optional[Zone], res: Optional[Zone]) -> Tuple[bool, str]:
-    # IMPORTANT: This will now be called with 1h zones (setup zones)
+    # break against 1h zones (setup levels)
     if side == "LONG":
         if not res:
             return False, "No 1h resistance zone"
@@ -379,6 +385,7 @@ def is_break_event(side: str, close: float, sup: Optional[Zone], res: Optional[Z
         if not sup:
             return False, "No 1h support zone"
         return (close < sup.low), f"1h Breakdown (close<{sup.low:.6f})"
+
 
 def entry_filters_quality(
     side: str,
@@ -394,17 +401,22 @@ def entry_filters_quality(
     break_event: bool
 ) -> Tuple[bool, str]:
     """
-    QUALITY:
-    - 4h gives direction (bias); 1h gives levels; 15m is trigger.
-    - If bias SHORT but 15m EMAs flipped (pullback), we allow "resume" ONLY on true breakdown + under both EMAs + slope down again.
-    - LONG needs RSI50 cross (15m) (if enabled).
+    Fix for your logs:
+    - If 4h bias is SHORT but 15m EMAs not aligned, we still allow SHORT when "micro-trend" is bearish:
+      close < EMA20 and EMA20 slope down.
+    - Symmetric for LONG.
+    - Still requires 1h break + confirm + pullback later (so quality stays high).
     """
     vol_ok = (vma > 0) and (v >= vma * VOL_RATIO_BASE)
 
     if side == "SHORT":
         aligned = (e20v < e50v)
 
-        resume_short = (
+        micro_bearish = False
+        if MICRO_TREND_ENABLED:
+            micro_bearish = (c < e20v) and ema_slope_down(e20_series, EMA_SLOPE_LEN)
+
+        resume_short_strict = (
             (not aligned)
             and break_event
             and (c < min(e20v, e50v))
@@ -413,10 +425,10 @@ def entry_filters_quality(
             and (r15 < RESUME_SHORT_MAX_RSI)
         )
 
-        if not (aligned or resume_short):
+        if not (aligned or micro_bearish or resume_short_strict):
             return False, "15m not bearish yet (waiting pullback to finish)"
 
-        # late short protection
+        # oversold protection (avoid late shorts)
         if r15 < RSI_SHORT_MIN:
             if not break_event:
                 return False, f"RSI too low for SHORT ({r15:.2f} < {RSI_SHORT_MIN})"
@@ -430,7 +442,11 @@ def entry_filters_quality(
     if side == "LONG":
         aligned = (e20v > e50v)
 
-        resume_long = (
+        micro_bullish = False
+        if MICRO_TREND_ENABLED:
+            micro_bullish = (c > e20v) and ema_slope_up(e20_series, EMA_SLOPE_LEN)
+
+        resume_long_strict = (
             (not aligned)
             and break_event
             and (c > max(e20v, e50v))
@@ -439,7 +455,7 @@ def entry_filters_quality(
             and (r15 > RESUME_LONG_MIN_RSI)
         )
 
-        if not (aligned or resume_long):
+        if not (aligned or micro_bullish or resume_long_strict):
             return False, "15m not bullish yet (waiting dip to finish)"
 
         if QUALITY_LONG_NEEDS_RSI50_CROSS:
@@ -462,7 +478,6 @@ def entry_filters_quality(
 # =========================
 
 def confirm_rule2(side: str, breakout_high: float, breakout_low: float, confirm_close: float) -> bool:
-    # confirm candle must close beyond breakout candle extreme
     if side == "LONG":
         return confirm_close > breakout_high
     return confirm_close < breakout_low
@@ -527,7 +542,7 @@ def build_entry_html(p: Pending, entry_price: float, entry_open_ts: pd.Timestamp
     t3 = to_local(entry_open_ts)
 
     return (
-        f"{head} <b>ENTRY</b> ({p.tag} | 1h-Setup + 15m-Trigger ✅)\n\n"
+        f"{head} <b>ENTRY</b> (TREND | 1h-Setup + 15m-Trigger ✅)\n\n"
         f"📊 <b>Pair:</b> {pair}\n"
         f"🕒 <b>t0 Break Close (15m):</b> {t0}\n"
         f"✅ <b>t1 Confirm Close:</b> {t1}\n"
@@ -566,9 +581,7 @@ def main():
 
     print(
         f"✅ BOT AKTIV – Fakeout={'ON' if FAKEOUT_ENABLED else 'OFF'} | "
-        f"Trigger=1hZones+15mBreak | "
-        f"Bias=4h | "
-        f"RSI50CrossLong={'ON' if QUALITY_LONG_NEEDS_RSI50_CROSS else 'OFF'} | "
+        f"Bias=4h | Trigger=1hZones+15mBreak | MicroTrend={'ON' if MICRO_TREND_ENABLED else 'OFF'} | "
         f"Telegram={'ON' if telegram_enabled() else 'OFF'}",
         flush=True
     )
@@ -593,28 +606,25 @@ def main():
                 if len(df15_raw) < 120 or len(df1h) < 140 or len(df4h) < 140:
                     continue
 
-                ts_open = df15_raw.index[-1]   # current 15m open candle ts
-                ts_close = df15_raw.index[-2]  # last closed 15m candle ts
+                ts_open = df15_raw.index[-1]
+                ts_close = df15_raw.index[-2]
 
                 # =========================
-                # Handle pending pipeline (confirm -> pullback -> entry open)
+                # pending pipeline
                 # =========================
                 if symbol in pending:
                     p = pending[symbol]
 
-                    # WAIT_CONFIRM: confirm candle closes at p.confirm_ts
                     if p.stage == "WAIT_CONFIRM" and ts_close == p.confirm_ts:
                         confirm_close = float(df15_raw["close"].iloc[-2])
                         ok_confirm = (not FAKEOUT_ENABLED) or confirm_rule2(p.side, p.breakout_high, p.breakout_low, confirm_close)
-
                         if not ok_confirm:
-                            print(f"[{symbol}] Rule2 FAIL (confirm) tag={p.tag}", flush=True)
+                            print(f"[{symbol}] Rule2 FAIL (confirm)", flush=True)
                             del pending[symbol]
                         else:
                             p.stage = "WAIT_PULLBACK"
                             p.pullback_ts = ts_open
 
-                    # WAIT_PULLBACK: next candle closes at pullback_ts
                     if symbol in pending and pending[symbol].stage == "WAIT_PULLBACK":
                         p2 = pending[symbol]
                         if p2.pullback_ts is not None and ts_close == p2.pullback_ts:
@@ -627,34 +637,31 @@ def main():
                             ok_vol = (not FAKEOUT_ENABLED) or pullback_rule1_volume(pull_vol, p2.breakout_vol)
 
                             if not ok_pull:
-                                print(f"[{symbol}] Pullback FAIL tag={p2.tag}", flush=True)
+                                print(f"[{symbol}] Pullback FAIL", flush=True)
                                 del pending[symbol]
                             elif not ok_vol:
-                                print(f"[{symbol}] Rule1 FAIL (pullback vol) tag={p2.tag}", flush=True)
+                                print(f"[{symbol}] Rule1 FAIL (pullback vol)", flush=True)
                                 del pending[symbol]
                             else:
                                 p2.stage = "WAIT_ENTRY"
                                 p2.entry_open_ts = ts_open
 
-                    # WAIT_ENTRY: entry on next candle open
                     if symbol in pending and pending[symbol].stage == "WAIT_ENTRY":
                         p3 = pending[symbol]
                         if p3.entry_open_ts is not None and ts_open == p3.entry_open_ts:
                             open_price = float(df15_raw["open"].iloc[-1])
-
                             entry_low, entry_high = entry_range_from_price(p3.breakout_close)
-                            in_range = entry_low <= open_price <= entry_high
 
-                            # invalidate if open already beyond SL (gap)
+                            in_range = entry_low <= open_price <= entry_high
                             plan_tmp = build_plan(p3.side, (entry_low + entry_high) / 2.0, p3.atr)
                             sl = plan_tmp["sl"]
                             invalid = (open_price >= sl) if p3.side.upper() == "SHORT" else (open_price <= sl)
 
                             if invalid:
-                                print(f"[{symbol}] Entry invalid at open tag={p3.tag}", flush=True)
+                                print(f"[{symbol}] Entry invalid at open", flush=True)
                                 del pending[symbol]
                             elif not in_range:
-                                print(f"[{symbol}] Entry open not in range tag={p3.tag} (open={open_price:.6f})", flush=True)
+                                print(f"[{symbol}] Entry open not in range (open={open_price:.6f})", flush=True)
                                 del pending[symbol]
                             else:
                                 msg = build_entry_html(p3, entry_price=open_price, entry_open_ts=ts_open)
@@ -665,7 +672,7 @@ def main():
                                 del pending[symbol]
 
                 # =========================
-                # New setup only once per closed 15m candle
+                # new setup only once per 15m close
                 # =========================
                 if last_processed_close.get(symbol) == ts_close:
                     continue
@@ -698,17 +705,15 @@ def main():
                 bias_1h = compute_bias(df1h)
                 bias_4h = compute_bias(df4h)
 
-                # master direction
                 if bias_4h.direction not in ("LONG", "SHORT"):
                     print(f"[{symbol}] close={ts_close} bias=NEUTRAL (4h neutral)", flush=True)
                     continue
 
                 side = bias_4h.direction
 
-                # 1h trigger zones (setup)
+                # 1h trigger zones
                 sup_1h, res_1h = best_pivot_zones(df1h, current_price=c, lookback=LOOKBACK_1H, pad_pct=ZONE_PAD_PCT_1H)
-
-                # 4h map zones (for context)
+                # 4h map zones
                 sup_4h, res_4h = best_pivot_zones(df4h, current_price=c, lookback=LOOKBACK_4H, pad_pct=ZONE_PAD_PCT_4H)
 
                 break_ok, break_reason = is_break_event(side, c, sup_1h, res_1h)
@@ -730,7 +735,6 @@ def main():
                     print(f"[{symbol}] close={ts_close} bias={side} break=NO ({break_reason}) rsi15={r15:.2f}", flush=True)
                     continue
 
-                # Create pending pipeline
                 if symbol not in pending:
                     row = df15_raw.iloc[-2]
                     pending[symbol] = Pending(
@@ -760,7 +764,7 @@ def main():
                     )
                     print(f"[{symbol}] ✅ Pending TREND: {side} | {break_reason} | wait CONFIRM at {ts_open}", flush=True)
 
-                time.sleep(0.2)  # tiny spacing between symbols
+                time.sleep(0.2)
 
             time.sleep(LOOP_SLEEP_SECONDS)
 
