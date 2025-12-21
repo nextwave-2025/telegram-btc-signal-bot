@@ -39,9 +39,12 @@ ATR_MULT = 1.5
 MIN_BODY_TO_RANGE = 0.55
 MIN_RANGE_ATR_MULT = 0.70
 
-# Retest quality: wick rejection
-RETEST_MIN_WICK_RATIO = 0.35   # wick portion of range
-RETEST_MAX_BODY_RATIO = 0.75   # avoid huge full-body candles (often continuation; still ok but keep quality)
+# Retest quality: wick rejection (RELAXED but still quality)
+RETEST_MIN_WICK_RATIO = 0.25
+RETEST_MAX_BODY_RATIO = 0.80
+
+# NEW: allow "near miss" to count as retest touch (proximity)
+RETEST_PROX_PCT = 0.0010  # 0.10% of price
 
 # Micro trend softness (avoid being blocked by tiny EMA flips)
 MICRO_TREND_ENABLED = True
@@ -374,7 +377,6 @@ def compute_bias(df: pd.DataFrame) -> Bias:
         return Bias("SHORT")
     return Bias("NEUTRAL")
 
-# Breakout / Breakdown trigger (HTML safe text)
 def is_break_event(side: str, close: float, sup: Optional["Zone"], res: Optional["Zone"]) -> Tuple[bool, str, Optional[float]]:
     if side == "LONG":
         if not res:
@@ -426,40 +428,50 @@ def retest_event(
     side: str,
     row: pd.Series,
     sup: Optional[Zone],
-    res: Optional[Zone]
+    res: Optional[Zone],
+    last_close: float
 ) -> Tuple[bool, str, Optional[Tuple[float, float]]]:
     """
-    Retest idea:
-      SHORT: price wicks into 1h resistance zone, then closes back below zone.low (rejection)
-      LONG : price wicks into 1h support zone, then closes back above zone.high (bounce)
-    Returns:
-      ok, reason, safe_zone_range (low, high) -> the zone itself as safe entry
+    RELAXED Retest (still quality):
+      SHORT: candle touches or comes near 1h resistance, closes NOT above zone.high, shows rejection (upper wick)
+      LONG : candle touches or comes near 1h support, closes NOT below zone.low, shows rejection (lower wick)
     """
     o = float(row["open"]); h = float(row["high"]); l = float(row["low"]); c = float(row["close"])
     up_w, lo_w, body_r, _ = wick_metrics(o, h, l, c)
 
+    prox = max(last_close * RETEST_PROX_PCT, 1e-12)
+
     if side == "SHORT":
         if not res:
             return False, "No 1h resistance zone", None
-        touched = h >= res.low
-        rejected = c < res.low  # closes back below zone
-        bearish = c <= o
+
+        # Touch OR near zone
+        near_or_touch = (h >= res.low) or (abs(res.low - h) <= prox) or (abs(res.low - c) <= prox)
+        # Must not close above zone high (avoid real breakout)
+        not_breaking = c <= res.high
+        # Rejection quality
         wick_ok = up_w >= RETEST_MIN_WICK_RATIO
         body_ok = body_r <= RETEST_MAX_BODY_RATIO
-        if touched and rejected and bearish and wick_ok and body_ok:
+        bearish_or_small = (c <= o) or (body_r <= 0.35)
+
+        if near_or_touch and not_breaking and wick_ok and body_ok and bearish_or_small:
             return True, f"1h Retest SHORT ✅ (Rejection an Resistance {fmt_zone(res)})", (res.low, res.high)
+
         return False, "1h Retest SHORT warten", (res.low, res.high)
 
     if side == "LONG":
         if not sup:
             return False, "No 1h support zone", None
-        touched = l <= sup.high
-        bounced = c > sup.high  # closes back above zone
-        bullish = c >= o
+
+        near_or_touch = (l <= sup.high) or (abs(l - sup.high) <= prox) or (abs(c - sup.high) <= prox)
+        not_breaking = c >= sup.low
         wick_ok = lo_w >= RETEST_MIN_WICK_RATIO
         body_ok = body_r <= RETEST_MAX_BODY_RATIO
-        if touched and bounced and bullish and wick_ok and body_ok:
+        bullish_or_small = (c >= o) or (body_r <= 0.35)
+
+        if near_or_touch and not_breaking and wick_ok and body_ok and bullish_or_small:
             return True, f"1h Retest LONG ✅ (Bounce an Support {fmt_zone(sup)})", (sup.low, sup.high)
+
         return False, "1h Retest LONG warten", (sup.low, sup.high)
 
     return False, "Invalid side", None
@@ -492,7 +504,6 @@ def entry_filters_quality(
             return False, "15m not bearish yet (waiting pullback to finish)"
 
         if r15 < RSI_SHORT_MIN:
-            # allow exception only if it is an actual BREAK trigger with strong volume
             if not trigger_is_break:
                 return False, f"RSI too low for SHORT ({r15:.2f} < {RSI_SHORT_MIN})"
             if vol_ratio < VOL_RATIO_IF_RSI_EXCEPTION:
@@ -562,7 +573,6 @@ def build_retest_plan(side: str, entry_price: float, zone_low: float, zone_high:
         buffer = entry_price * 0.0015
 
     if side == "SHORT":
-        # SL above zone high + buffer (but cap at 2%)
         desired_dist = max((zone_high + buffer) - entry_price, atr_val * 0.9 if atr_val else entry_price * 0.004)
     else:
         desired_dist = max(entry_price - (zone_low - buffer), atr_val * 0.9 if atr_val else entry_price * 0.004)
@@ -591,13 +601,9 @@ def build_setup_message(
     pair = symbol.replace(":USDT", "").replace("/", "")
     t_local = to_local_str(ts_close)
 
-    # Aggressive entry = current close
     aggressive_entry = c
     ag_low, ag_high = entry_range_from_price(aggressive_entry)
 
-    # Safe entry:
-    # - BREAK: pullback around break_level
-    # - RETEST: the 1h zone itself (support/resistance zone)
     if trigger_kind == "BREAK" and break_level is not None:
         pb_low, pb_high = pullback_zone(break_level)
         safe_label = f"{pb_low:.6f} – {pb_high:.6f}"
@@ -611,7 +617,6 @@ def build_setup_message(
         safe_mid = (z_low + z_high) / 2.0
         safe_plan = build_retest_plan(side_u, safe_mid, z_low, z_high, atrv)
 
-    # Aggressive plan: use ATR
     ag_plan = build_plan(side_u, aggressive_entry, atrv)
 
     return (
@@ -691,7 +696,6 @@ def decrement_freeze(frozen: Dict[str, FrozenZones], symbol: str):
 def main():
     ex = make_exchange()
 
-    # normalize symbols
     symbols = [to_bybit_linear(s) for s in SYMBOLS]
     markets = ex.load_markets()
     symbols = [s for s in symbols if s in markets and markets[s].get("active", True)]
@@ -711,7 +715,6 @@ def main():
     df_cache: Dict[Tuple[str, str], CacheItem] = {}
     frozen_zones: Dict[str, FrozenZones] = {}
 
-    # refresh intervals (reduce RateLimit)
     refresh_15m = 35
     refresh_1h  = 180
     refresh_4h  = 240
@@ -727,7 +730,6 @@ def main():
                 if len(df15_raw) < 160:
                     continue
 
-                # last closed 15m candle
                 ts_close = df15_raw.index[-2]
                 if last_processed_close.get(symbol) == ts_close:
                     continue
@@ -744,7 +746,6 @@ def main():
                     decrement_freeze(frozen_zones, symbol)
                     continue
 
-                # indicators
                 close_series = df15_closed["close"]
                 rsi15_series = rsi(close_series, RSI_LEN)
                 r15 = float(rsi15_series.iloc[-1])
@@ -766,7 +767,6 @@ def main():
                 atr_series = atr(df15_closed, ATR_LEN)
                 atrv = float(atr_series.iloc[-1]) if not np.isnan(atr_series.iloc[-1]) else 0.0
 
-                # bias
                 bias_4h = compute_bias(df4h)
                 if bias_4h.direction not in ("LONG", "SHORT"):
                     print(f"[{symbol}] close={ts_close} bias=NEUTRAL (4h neutral)", flush=True)
@@ -775,26 +775,22 @@ def main():
 
                 side = bias_4h.direction
 
-                # zones: 1h frozen, 4h live
                 fz = maybe_update_frozen_zones(frozen_zones, symbol, df1h, current_price=last_close)
                 sup_1h, res_1h = fz.sup_1h, fz.res_1h
                 sup_4h, res_4h = best_pivot_zones(df4h, current_price=last_close, lookback=LOOKBACK_4H, pad_pct=ZONE_PAD_PCT_4H)
 
-                # trigger candle (last closed)
                 trigger_row = df15_raw.iloc[-2]
 
-                # 1) BREAK trigger
                 break_ok, break_reason, break_level = is_break_event(side, last_close, sup_1h, res_1h)
 
-                # 2) RETEST trigger (only if break not ok)
-                ret_ok, ret_reason, ret_safe_zone = retest_event(side, trigger_row, sup_1h, res_1h)
+                ret_ok, ret_reason, ret_safe_zone = retest_event(side, trigger_row, sup_1h, res_1h, last_close)
 
                 if not break_ok and not ret_ok:
-                    # log both statuses compact
-                    if side == "SHORT":
-                        print(f"[{symbol}] close={ts_close} bias=SHORT trigger=NO (break: {break_reason} | retest: {ret_reason}) rsi15={r15:.2f}", flush=True)
-                    else:
-                        print(f"[{symbol}] close={ts_close} bias=LONG  trigger=NO (break: {break_reason} | retest: {ret_reason}) rsi15={r15:.2f}", flush=True)
+                    print(
+                        f"[{symbol}] close={ts_close} bias={side} trigger=NO "
+                        f"(break: {break_reason} | retest: {ret_reason}) rsi15={r15:.2f}",
+                        flush=True
+                    )
                     decrement_freeze(frozen_zones, symbol)
                     continue
 
@@ -802,7 +798,6 @@ def main():
                 trigger_text = break_reason if break_ok else ret_reason
                 safe_zone = None if break_ok else ret_safe_zone
 
-                # quality filters (note: we only allow RSI-short exception for BREAK)
                 ok, why = entry_filters_quality(
                     side, last_close,
                     e20v, e50v,
@@ -816,7 +811,6 @@ def main():
                     decrement_freeze(frozen_zones, symbol)
                     continue
 
-                # candle strength confirmation
                 strong_ok, strong_why = candle_strength_ok(trigger_row, atrv)
                 if not strong_ok:
                     print(f"[{symbol}] close={ts_close} bias={side} setup=NO ({strong_why}) rsi15={r15:.2f}", flush=True)
