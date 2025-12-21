@@ -18,48 +18,42 @@ from zoneinfo import ZoneInfo
 
 LOCAL_TZ = "Europe/Berlin"
 
-TF_ENTRY = "15m"   # trigger timeframe
-TF_SETUP = "1h"    # zones timeframe
-TF_BIAS  = "4h"    # master bias
+TF_ENTRY = "15m"
+TF_ZONES = "1h"
+TF_BIAS  = "4h"
 TF_DAILY = "1d"
 
 EMA_FAST = 20
 EMA_SLOW = 50
 RSI_LEN  = 14
 
-# Fakeout rules (you asked for them)
-FAKEOUT_ENABLED = True
-# Rule A: Pullback candle volume must NOT exceed breakout candle volume (we use it only as quality filter)
-# Rule B: Follow-through confirmation: breakout candle close must be "clean" beyond zone & strong body
-
-# RSI filters (keep quality)
-RSI_SHORT_MIN = 42.0          # avoid late shorts in oversold unless huge volume
-RSI_LONG_MAX  = 72.0          # avoid late longs when too extended
-QUALITY_LONG_NEEDS_RSI50_CROSS = True  # long momentum: RSI crosses above 50 on 15m
-
-# Volume filters
+# Quality > quantity filters
 VOL_MA_LEN = 20
-VOL_RATIO_MIN_SETUP = 1.15     # require breakout candle volume >= 1.15 * volma
+VOL_RATIO_MIN_SETUP = 1.15       # breakout candle volume >= 1.15x VolMA
 VOL_RATIO_IF_RSI_EXCEPTION = 1.30
 
-# Breakout candle strength filters (quality > quantity)
-MIN_BODY_TO_RANGE = 0.55       # body >= 55% of candle range
-MIN_RANGE_ATR_MULT = 0.70      # candle range >= 0.70 * ATR(14)
+ATR_LEN = 14
+ATR_MULT = 1.5
+MIN_BODY_TO_RANGE = 0.55
+MIN_RANGE_ATR_MULT = 0.70
 
 # Micro trend softness (avoid being blocked by tiny EMA flips)
 MICRO_TREND_ENABLED = True
-EMA_ALIGN_TOL_PCT = 0.001      # 0.10%
+EMA_ALIGN_TOL_PCT = 0.001        # 0.10%
 EMA_SLOPE_LEN = 3
 
-# Pullback zone behavior (THIS is your new “safe entry zone”)
-PULLBACK_PAD_PCT = 0.0012      # 0.12% around breakout level
-PULLBACK_VALID_CANDLES = 6     # safe entry zone valid for next 6 candles (90 minutes)
+# RSI filters
+RSI_SHORT_MIN = 42.0
+RSI_LONG_MAX  = 72.0
+QUALITY_LONG_NEEDS_RSI50_CROSS = True
+
+# Entries
+ENTRY_PAD_PCT = 0.0006
+PULLBACK_PAD_PCT = 0.0012
+PULLBACK_VALID_CANDLES = 6
 
 # Risk
-ATR_LEN = 14
-ATR_MULT = 1.5
 MAX_SL_PCT = 0.02
-ENTRY_PAD_PCT = 0.0006
 RR_TARGETS = (1, 2, 3)
 
 # Pivot zones
@@ -70,7 +64,16 @@ LOOKBACK_4H = 140
 ZONE_PAD_PCT_1H = 0.0010
 ZONE_PAD_PCT_4H = 0.0012
 
+# =========================
+# ZONE FREEZE
+# =========================
+# Freeze 1h zones for N processed 15m closes
+ZONE_FREEZE_ENABLED = True
+ZONE_FREEZE_CANDLES_15M = 8   # 8 * 15m = 2 hours (stabiler Trigger)
+
+# =========================
 # Telegram env (both naming styles)
+# =========================
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 CHAT_ID   = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID") or "").strip()
 
@@ -79,7 +82,7 @@ ALERT_US_OPENING_TIME = "15:15"
 ALERT_US_CLOSING_TIME = "21:45"
 DELETE_BOT_MESSAGES_AT = "00:00"
 
-# Runtime / rate limit
+# Runtime
 LOOP_SLEEP_SECONDS = 25
 RATE_LIMIT_BACKOFF_SECONDS = 60
 
@@ -174,8 +177,8 @@ def local_now() -> pd.Timestamp:
 def today_key(ts: pd.Timestamp) -> str:
     return ts.strftime("%Y-%m-%d")
 
-def to_local_str(ts: pd.Timestamp) -> str:
-    return ts.to_pydatetime().astimezone(ZoneInfo(LOCAL_TZ)).strftime("%Y-%m-%d %H:%M:%S %Z")
+def to_local_str(ts_utc: pd.Timestamp) -> str:
+    return ts_utc.to_pydatetime().astimezone(ZoneInfo(LOCAL_TZ)).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 def maybe_send_scheduled_alerts(state: Dict[str, str], sent_ids: List[int]):
     now = local_now()
@@ -201,7 +204,6 @@ def maybe_midnight_cleanup(state: Dict[str, str], sent_ids: List[int]):
     now = local_now()
     hhmm = now.strftime("%H:%M")
     day = today_key(now)
-
     if hhmm != DELETE_BOT_MESSAGES_AT:
         return
     if state.get("midnight_cleanup") == day:
@@ -258,7 +260,7 @@ def ema_slope_up(e: pd.Series, n: int = 3) -> bool:
 
 
 # =========================
-# PIVOT ZONES
+# ZONES
 # =========================
 
 def _pivots(series: pd.Series, left: int, right: int, mode: str) -> List[Tuple[pd.Timestamp, float]]:
@@ -305,22 +307,15 @@ def best_pivot_zones(df: pd.DataFrame, current_price: float, lookback: int, pad_
 def fmt_zone(z: Optional[Zone]) -> str:
     if not z:
         return "—"
+    # show less decimals for big prices
+    if z.high >= 1000:
+        return f"{z.low:.2f}–{z.high:.2f}"
     return f"{z.low:.6f}–{z.high:.6f}"
 
 
 # =========================
-# STRATEGY CORE
+# EXCHANGE / FETCH (with caching to reduce RateLimit)
 # =========================
-
-def compute_bias(df: pd.DataFrame) -> Bias:
-    close = df["close"]
-    e20 = float(ema(close, EMA_FAST).iloc[-1])
-    e50 = float(ema(close, EMA_SLOW).iloc[-1])
-    if e20 > e50:
-        return Bias("LONG")
-    if e20 < e50:
-        return Bias("SHORT")
-    return Bias("NEUTRAL")
 
 def to_bybit_linear(sym: str) -> str:
     return sym if ":" in sym else f"{sym}:USDT"
@@ -338,26 +333,66 @@ def fetch_df(exchange: ccxt.Exchange, symbol: str, tf: str, limit: int = 300) ->
     df.set_index("ts", inplace=True)
     return df
 
-def is_break_event(side: str, close: float, sup: Optional[Zone], res: Optional[Zone]) -> Tuple[bool, str, Optional[float]]:
-    """
-    Returns:
-      break_ok, reason, break_level
-    break_level is:
-      LONG  -> resistance.high
-      SHORT -> support.low
-    """
+@dataclass
+class CacheItem:
+    df: pd.DataFrame
+    last_fetch: float
+
+def get_df_cached(
+    ex: ccxt.Exchange,
+    cache: Dict[Tuple[str, str], CacheItem],
+    symbol: str,
+    tf: str,
+    limit: int,
+    refresh_seconds: int
+) -> pd.DataFrame:
+    key = (symbol, tf)
+    now = time.time()
+    item = cache.get(key)
+    if item is None or (now - item.last_fetch) >= refresh_seconds:
+        df = fetch_df(ex, symbol, tf, limit=limit)
+        cache[key] = CacheItem(df=df, last_fetch=now)
+        return df
+    return item.df
+
+
+# =========================
+# STRATEGY CORE
+# =========================
+
+def compute_bias(df: pd.DataFrame) -> Bias:
+    close = df["close"]
+    e20 = float(ema(close, EMA_FAST).iloc[-1])
+    e50 = float(ema(close, EMA_SLOW).iloc[-1])
+    if e20 > e50:
+        return Bias("LONG")
+    if e20 < e50:
+        return Bias("SHORT")
+    return Bias("NEUTRAL")
+
+# ✅ FIXED: clear log text even when break=NO
+def is_break_event(side: str, close: float, sup: Optional["Zone"], res: Optional["Zone"]) -> Tuple[bool, str, Optional[float]]:
     if side == "LONG":
         if not res:
             return False, "No 1h resistance zone", None
         lvl = float(res.high)
-        return (close > lvl), f"1h Breakout (close>{lvl:.6f})", lvl
-    else:
+        ok = close > lvl
+        if ok:
+            return True, f"1h Breakout ✅ (close {close:.6f} > {lvl:.6f})", lvl
+        return False, f"1h Breakout warten (close {close:.6f} <= {lvl:.6f})", lvl
+
+    if side == "SHORT":
         if not sup:
             return False, "No 1h support zone", None
         lvl = float(sup.low)
-        return (close < lvl), f"1h Breakdown (close<{lvl:.6f})", lvl
+        ok = close < lvl
+        if ok:
+            return True, f"1h Breakdown ✅ (close {close:.6f} < {lvl:.6f})", lvl
+        return False, f"1h Breakdown warten (close {close:.6f} >= {lvl:.6f})", lvl
 
-def candle_strength_ok(row: pd.Series, atr_val: float) -> Tuple[bool, str, float, float]:
+    return False, "Invalid side", None
+
+def candle_strength_ok(row: pd.Series, atr_val: float) -> Tuple[bool, str]:
     o = float(row["open"])
     h = float(row["high"])
     l = float(row["low"])
@@ -368,13 +403,13 @@ def candle_strength_ok(row: pd.Series, atr_val: float) -> Tuple[bool, str, float
     body_ratio = body / rng
 
     if body_ratio < MIN_BODY_TO_RANGE:
-        return False, f"Body too small ({body_ratio:.2f} < {MIN_BODY_TO_RANGE})", body_ratio, rng
+        return False, f"Body too small ({body_ratio:.2f} < {MIN_BODY_TO_RANGE})"
 
     if atr_val and atr_val > 0:
         if rng < atr_val * MIN_RANGE_ATR_MULT:
-            return False, f"Range too small vs ATR ({rng:.6f} < {MIN_RANGE_ATR_MULT}xATR)", body_ratio, rng
+            return False, f"Range too small vs ATR ({rng:.6f} < {MIN_RANGE_ATR_MULT}xATR)"
 
-    return True, "OK", body_ratio, rng
+    return True, "OK"
 
 def entry_filters_quality(
     side: str,
@@ -403,7 +438,6 @@ def entry_filters_quality(
         if not (aligned or micro):
             return False, "15m not bearish yet (waiting pullback to finish)"
 
-        # oversold protection
         if r15 < RSI_SHORT_MIN:
             if not break_event:
                 return False, f"RSI too low for SHORT ({r15:.2f} < {RSI_SHORT_MIN})"
@@ -497,11 +531,10 @@ def build_setup_message(
     pair = symbol.replace(":USDT", "").replace("/", "")
     t_local = to_local_str(ts_close)
 
-    # Optional: show also tiny range around aggressive entry
     ag_low, ag_high = entry_range_from_price(aggressive_entry)
 
     return (
-        f"{head} <b>SETUP</b> (Breakout + Volumen ✅)\n\n"
+        f"{head} <b>SETUP</b>\n\n"
         f"📊 <b>Pair:</b> {pair}\n"
         f"🕒 <b>Zeit (15m Close):</b> {t_local}\n"
         f"📌 <b>Trigger:</b> {break_reason}\n\n"
@@ -519,7 +552,7 @@ def build_setup_message(
         f"   ✅ TP3: {safe_plan['tp3']:.6f}\n\n"
         f"📍 <b>RSI:</b> 15m={r15:.2f} | 4h={r4h:.2f} | 1d={r1d:.2f}\n"
         f"📦 <b>Vol:</b> Ratio={vol_ratio:.2f}x (vs VolMA{VOL_MA_LEN})\n\n"
-        f"🧱 <b>1h Zones:</b>\n"
+        f"🧱 <b>1h Zones (frozen):</b>\n"
         f"Support: {fmt_zone(sup_1h)}\n"
         f"Resistance: {fmt_zone(res_1h)}\n\n"
         f"🗺️ <b>4h Zones:</b>\n"
@@ -531,18 +564,60 @@ def build_setup_message(
 
 
 # =========================
+# ZONE FREEZE STATE
+# =========================
+
+@dataclass
+class FrozenZones:
+    sup_1h: Optional[Zone]
+    res_1h: Optional[Zone]
+    remaining_15m: int
+
+def maybe_update_frozen_zones(
+    frozen: Dict[str, FrozenZones],
+    symbol: str,
+    df1h: pd.DataFrame,
+    current_price: float
+) -> FrozenZones:
+    if not ZONE_FREEZE_ENABLED:
+        sup, res = best_pivot_zones(df1h, current_price=current_price, lookback=LOOKBACK_1H, pad_pct=ZONE_PAD_PCT_1H)
+        return FrozenZones(sup, res, remaining_15m=0)
+
+    f = frozen.get(symbol)
+    if f is None or f.remaining_15m <= 0:
+        sup, res = best_pivot_zones(df1h, current_price=current_price, lookback=LOOKBACK_1H, pad_pct=ZONE_PAD_PCT_1H)
+        f = FrozenZones(sup, res, remaining_15m=ZONE_FREEZE_CANDLES_15M)
+        frozen[symbol] = f
+        return f
+
+    # still frozen
+    return f
+
+def decrement_freeze(frozen: Dict[str, FrozenZones], symbol: str):
+    if not ZONE_FREEZE_ENABLED:
+        return
+    f = frozen.get(symbol)
+    if not f:
+        return
+    f.remaining_15m -= 1
+    if f.remaining_15m < 0:
+        f.remaining_15m = 0
+
+
+# =========================
 # MAIN
 # =========================
 
 def main():
     ex = make_exchange()
 
+    # normalize symbols
     symbols = [to_bybit_linear(s) for s in SYMBOLS]
     markets = ex.load_markets()
     symbols = [s for s in symbols if s in markets and markets[s].get("active", True)]
 
     print(
-        f"✅ BOT AKTIV – Fakeout={'ON' if FAKEOUT_ENABLED else 'OFF'} | "
+        f"✅ BOT AKTIV – ZoneFreeze={'ON' if ZONE_FREEZE_ENABLED else 'OFF'}({ZONE_FREEZE_CANDLES_15M}x15m) | "
         f"Bias=4h | Trigger=1hZones+15mBreak | MicroTrend={'ON' if MICRO_TREND_ENABLED else 'OFF'} | "
         f"Telegram={'ON' if telegram_enabled() else 'OFF'}",
         flush=True
@@ -553,29 +628,45 @@ def main():
     alert_state: Dict[str, str] = {}
     sent_bot_message_ids: List[int] = []
 
+    df_cache: Dict[Tuple[str, str], CacheItem] = {}
+    frozen_zones: Dict[str, FrozenZones] = {}
+
+    # refresh intervals (reduce RateLimit)
+    refresh_15m = 35
+    refresh_1h  = 180
+    refresh_4h  = 240
+    refresh_1d  = 600
+
     while True:
         try:
             maybe_send_scheduled_alerts(alert_state, sent_bot_message_ids)
             maybe_midnight_cleanup(alert_state, sent_bot_message_ids)
 
             for symbol in symbols:
-                df15_raw = fetch_df(ex, symbol, TF_ENTRY, limit=320)
-                df1h = fetch_df(ex, symbol, TF_SETUP, limit=260)
-                df4h = fetch_df(ex, symbol, TF_BIAS, limit=260)
-                df1d = fetch_df(ex, symbol, TF_DAILY, limit=220)
-
-                if len(df15_raw) < 120 or len(df1h) < 140 or len(df4h) < 140:
+                # 15m often
+                df15_raw = get_df_cached(ex, df_cache, symbol, TF_ENTRY, limit=340, refresh_seconds=refresh_15m)
+                if len(df15_raw) < 140:
                     continue
 
-                ts_close = df15_raw.index[-2]   # last closed 15m candle
+                # last closed 15m candle
+                ts_close = df15_raw.index[-2]
                 if last_processed_close.get(symbol) == ts_close:
                     continue
                 last_processed_close[symbol] = ts_close
 
                 df15_closed = df15_raw.iloc[:-1].copy()
-                close_series = df15_closed["close"]
+                last_close = float(df15_closed["close"].iloc[-1])
 
-                # indicators on CLOSED candle
+                # higher TF less often
+                df1h = get_df_cached(ex, df_cache, symbol, TF_ZONES, limit=280, refresh_seconds=refresh_1h)
+                df4h = get_df_cached(ex, df_cache, symbol, TF_BIAS,  limit=260, refresh_seconds=refresh_4h)
+                df1d = get_df_cached(ex, df_cache, symbol, TF_DAILY, limit=220, refresh_seconds=refresh_1d)
+
+                if len(df1h) < 150 or len(df4h) < 150 or len(df1d) < 100:
+                    continue
+
+                # indicators
+                close_series = df15_closed["close"]
                 rsi15_series = rsi(close_series, RSI_LEN)
                 r15 = float(rsi15_series.iloc[-1])
                 r15_prev = float(rsi15_series.iloc[-2])
@@ -596,25 +687,28 @@ def main():
                 atr_series = atr(df15_closed, ATR_LEN)
                 atrv = float(atr_series.iloc[-1]) if not np.isnan(atr_series.iloc[-1]) else 0.0
 
+                # bias
                 bias_4h = compute_bias(df4h)
                 if bias_4h.direction not in ("LONG", "SHORT"):
                     print(f"[{symbol}] close={ts_close} bias=NEUTRAL (4h neutral)", flush=True)
+                    decrement_freeze(frozen_zones, symbol)
                     continue
 
                 side = bias_4h.direction
 
-                # zones
-                last_close = float(df15_closed["close"].iloc[-1])
-                sup_1h, res_1h = best_pivot_zones(df1h, current_price=last_close, lookback=LOOKBACK_1H, pad_pct=ZONE_PAD_PCT_1H)
+                # zones: 1h frozen, 4h live
+                fz = maybe_update_frozen_zones(frozen_zones, symbol, df1h, current_price=last_close)
+                sup_1h, res_1h = fz.sup_1h, fz.res_1h
                 sup_4h, res_4h = best_pivot_zones(df4h, current_price=last_close, lookback=LOOKBACK_4H, pad_pct=ZONE_PAD_PCT_4H)
 
-                # breakout/breakdown vs 1h zone
+                # break event (✅ fixed messaging)
                 break_ok, break_reason, break_level = is_break_event(side, last_close, sup_1h, res_1h)
                 if not break_ok or break_level is None:
                     print(f"[{symbol}] close={ts_close} bias={side} break=NO ({break_reason}) rsi15={r15:.2f}", flush=True)
+                    decrement_freeze(frozen_zones, symbol)
                     continue
 
-                # quality filter (EMA/RSI/vol)
+                # quality filters
                 ok, why = entry_filters_quality(
                     side, last_close,
                     e20v, e50v,
@@ -625,16 +719,18 @@ def main():
                 )
                 if not ok:
                     print(f"[{symbol}] close={ts_close} bias={side} setup=NO ({why}) rsi15={r15:.2f}", flush=True)
+                    decrement_freeze(frozen_zones, symbol)
                     continue
 
-                # breakout candle strength (strong candle + range)
+                # breakout candle strength
                 breakout_row = df15_raw.iloc[-2]
-                strong_ok, strong_why, body_ratio, rng = candle_strength_ok(breakout_row, atrv)
+                strong_ok, strong_why = candle_strength_ok(breakout_row, atrv)
                 if not strong_ok:
                     print(f"[{symbol}] close={ts_close} bias={side} setup=NO ({strong_why}) rsi15={r15:.2f}", flush=True)
+                    decrement_freeze(frozen_zones, symbol)
                     continue
 
-                # If everything passes -> send ONE message with both entries
+                # send ONE message containing aggressive + safe entries
                 msg = build_setup_message(
                     symbol=symbol,
                     side=side,
@@ -654,7 +750,11 @@ def main():
                 if mid:
                     sent_bot_message_ids.append(mid)
 
-                time.sleep(0.2)
+                # after a setup, keep zone frozen (don’t decrement immediately)
+                # but still decrement once per processed candle:
+                decrement_freeze(frozen_zones, symbol)
+
+                time.sleep(0.15)
 
             time.sleep(LOOP_SLEEP_SECONDS)
 
