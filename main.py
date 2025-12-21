@@ -27,9 +27,15 @@ EMA_FAST = 20
 EMA_SLOW = 50
 RSI_LEN  = 14
 
-# Quality > quantity filters
 VOL_MA_LEN = 20
-VOL_RATIO_MIN_SETUP = 1.15
+
+# NEW: dynamic volume thresholds (quality, but realistic)
+VOL_RATIO_MIN_BREAK  = 1.10   # breakout/breakdown needs more volume
+VOL_RATIO_MIN_RETEST = 1.00   # retest can be ok at ~avg volume
+
+# If candle is very strong we allow a tiny relaxation (still quality)
+VOL_STRONG_CANDLE_DISCOUNT = 0.05  # e.g. 1.10 -> 1.05
+
 VOL_RATIO_IF_RSI_EXCEPTION = 1.30
 
 ATR_LEN = 14
@@ -39,14 +45,14 @@ ATR_MULT = 1.5
 MIN_BODY_TO_RANGE = 0.55
 MIN_RANGE_ATR_MULT = 0.70
 
-# Retest quality: wick rejection (RELAXED but still quality)
+# Retest quality
 RETEST_MIN_WICK_RATIO = 0.25
 RETEST_MAX_BODY_RATIO = 0.80
 
-# NEW: allow "near miss" to count as retest touch (proximity)
+# allow proximity to count as retest touch
 RETEST_PROX_PCT = 0.0010  # 0.10% of price
 
-# Micro trend softness (avoid being blocked by tiny EMA flips)
+# Micro trend softness
 MICRO_TREND_ENABLED = True
 EMA_ALIGN_TOL_PCT = 0.001        # 0.10%
 EMA_SLOPE_LEN = 3
@@ -268,6 +274,29 @@ def ema_slope_up(e: pd.Series, n: int = 3) -> bool:
 
 
 # =========================
+# VOLUME (ROBUST)
+# =========================
+
+def robust_volma(vol: pd.Series, n: int = 20) -> float:
+    """
+    Robust VolMA:
+      - median protects against spikes
+      - mean keeps it responsive
+      We take max(median, mean*0.85) to avoid vma being inflated by one spike.
+    """
+    w = vol.tail(n).astype(float)
+    if len(w) < 3:
+        return float(w.mean()) if len(w) else 0.0
+
+    med = float(w.median())
+    mean = float(w.mean())
+    # damp mean slightly so one spike doesn't inflate too much
+    mean_damped = mean * 0.85
+
+    return max(med, mean_damped, 1e-12)
+
+
+# =========================
 # ZONES
 # =========================
 
@@ -431,11 +460,6 @@ def retest_event(
     res: Optional[Zone],
     last_close: float
 ) -> Tuple[bool, str, Optional[Tuple[float, float]]]:
-    """
-    RELAXED Retest (still quality):
-      SHORT: candle touches or comes near 1h resistance, closes NOT above zone.high, shows rejection (upper wick)
-      LONG : candle touches or comes near 1h support, closes NOT below zone.low, shows rejection (lower wick)
-    """
     o = float(row["open"]); h = float(row["high"]); l = float(row["low"]); c = float(row["close"])
     up_w, lo_w, body_r, _ = wick_metrics(o, h, l, c)
 
@@ -445,11 +469,8 @@ def retest_event(
         if not res:
             return False, "No 1h resistance zone", None
 
-        # Touch OR near zone
         near_or_touch = (h >= res.low) or (abs(res.low - h) <= prox) or (abs(res.low - c) <= prox)
-        # Must not close above zone high (avoid real breakout)
         not_breaking = c <= res.high
-        # Rejection quality
         wick_ok = up_w >= RETEST_MIN_WICK_RATIO
         body_ok = body_r <= RETEST_MAX_BODY_RATIO
         bearish_or_small = (c <= o) or (body_r <= 0.35)
@@ -484,13 +505,17 @@ def entry_filters_quality(
     e20_series: pd.Series,
     r15: float,
     r15_prev: float,
-    v: float,
-    vma: float,
-    trigger_is_break: bool
+    vol_ratio: float,
+    trigger_kind: str,  # "BREAK" or "RETEST"
+    strong_candle: bool
 ) -> Tuple[bool, str]:
-    vol_ratio = (v / vma) if (vma and vma > 0) else 0.0
-    if vol_ratio < VOL_RATIO_MIN_SETUP:
-        return False, f"Volume too low (v<{VOL_RATIO_MIN_SETUP:.2f}x vma)"
+    # dynamic vol threshold
+    base_thr = VOL_RATIO_MIN_BREAK if trigger_kind == "BREAK" else VOL_RATIO_MIN_RETEST
+    if strong_candle:
+        base_thr = max(0.90, base_thr - VOL_STRONG_CANDLE_DISCOUNT)
+
+    if vol_ratio < base_thr:
+        return False, f"Volume too low (v<{base_thr:.2f}x vma)"
 
     tol = EMA_ALIGN_TOL_PCT
 
@@ -504,7 +529,8 @@ def entry_filters_quality(
             return False, "15m not bearish yet (waiting pullback to finish)"
 
         if r15 < RSI_SHORT_MIN:
-            if not trigger_is_break:
+            # for BREAK we can still allow, but only with strong volume
+            if trigger_kind != "BREAK":
                 return False, f"RSI too low for SHORT ({r15:.2f} < {RSI_SHORT_MIN})"
             if vol_ratio < VOL_RATIO_IF_RSI_EXCEPTION:
                 return False, f"RSI low; need stronger volume ({vol_ratio:.2f}x < {VOL_RATIO_IF_RSI_EXCEPTION:.2f}x)"
@@ -637,7 +663,7 @@ def build_setup_message(
         f"   ✅ TP2: {safe_plan['tp2']:.6f}  (<b>CRV 1:2</b>)\n"
         f"   ✅ TP3: {safe_plan['tp3']:.6f}\n\n"
         f"📍 <b>RSI:</b> 15m={r15:.2f} | 4h={r4h:.2f} | 1d={r1d:.2f}\n"
-        f"📦 <b>Vol:</b> Ratio={vol_ratio:.2f}x (vs VolMA{VOL_MA_LEN})\n\n"
+        f"📦 <b>Vol:</b> Ratio={vol_ratio:.2f}x (vs robust VolMA{VOL_MA_LEN})\n\n"
         f"🧱 <b>1h Zones (frozen):</b>\n"
         f"Support: {fmt_zone(sup_1h)}\n"
         f"Resistance: {fmt_zone(res_1h)}\n\n"
@@ -759,9 +785,9 @@ def main():
                 e20v = float(e20_series.iloc[-1])
                 e50v = float(e50_series.iloc[-1])
 
-                volma_series = df15_closed["volume"].rolling(VOL_MA_LEN).mean()
+                # robust volume ratio
                 v = float(df15_closed["volume"].iloc[-1])
-                vma = float(volma_series.iloc[-1]) if not np.isnan(volma_series.iloc[-1]) else float(df15_closed["volume"].tail(VOL_MA_LEN).mean())
+                vma = robust_volma(df15_closed["volume"], VOL_MA_LEN)
                 vol_ratio = (v / vma) if (vma and vma > 0) else 0.0
 
                 atr_series = atr(df15_closed, ATR_LEN)
@@ -782,7 +808,6 @@ def main():
                 trigger_row = df15_raw.iloc[-2]
 
                 break_ok, break_reason, break_level = is_break_event(side, last_close, sup_1h, res_1h)
-
                 ret_ok, ret_reason, ret_safe_zone = retest_event(side, trigger_row, sup_1h, res_1h, last_close)
 
                 if not break_ok and not ret_ok:
@@ -798,22 +823,23 @@ def main():
                 trigger_text = break_reason if break_ok else ret_reason
                 safe_zone = None if break_ok else ret_safe_zone
 
+                strong_ok, strong_why = candle_strength_ok(trigger_row, atrv)
+                if not strong_ok:
+                    print(f"[{symbol}] close={ts_close} bias={side} setup=NO ({strong_why}) rsi15={r15:.2f}", flush=True)
+                    decrement_freeze(frozen_zones, symbol)
+                    continue
+
                 ok, why = entry_filters_quality(
                     side, last_close,
                     e20v, e50v,
                     e20_series,
                     r15, r15_prev,
-                    v, vma,
-                    trigger_is_break=bool(break_ok)
+                    vol_ratio=vol_ratio,
+                    trigger_kind=trigger_kind,
+                    strong_candle=strong_ok
                 )
                 if not ok:
                     print(f"[{symbol}] close={ts_close} bias={side} setup=NO ({why}) rsi15={r15:.2f}", flush=True)
-                    decrement_freeze(frozen_zones, symbol)
-                    continue
-
-                strong_ok, strong_why = candle_strength_ok(trigger_row, atrv)
-                if not strong_ok:
-                    print(f"[{symbol}] close={ts_close} bias={side} setup=NO ({strong_why}) rsi15={r15:.2f}", flush=True)
                     decrement_freeze(frozen_zones, symbol)
                     continue
 
