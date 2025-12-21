@@ -378,8 +378,8 @@ def is_break_event(side: str, close: float, sup: Optional["Zone"], res: Optional
         lvl = float(res.high)
         ok = close > lvl
         if ok:
-            return True, f"1h Breakout ✅ (close {close:.6f} > {lvl:.6f})", lvl
-        return False, f"1h Breakout warten (close {close:.6f} <= {lvl:.6f})", lvl
+            return True, f"1h Breakout ✅ (close {close:.6f} über {lvl:.6f})", lvl
+        return False, f"1h Breakout warten (close {close:.6f} noch nicht über {lvl:.6f})", lvl
 
     if side == "SHORT":
         if not sup:
@@ -387,8 +387,8 @@ def is_break_event(side: str, close: float, sup: Optional["Zone"], res: Optional
         lvl = float(sup.low)
         ok = close < lvl
         if ok:
-            return True, f"1h Breakdown ✅ (close {close:.6f} < {lvl:.6f})", lvl
-        return False, f"1h Breakdown warten (close {close:.6f} >= {lvl:.6f})", lvl
+            return True, f"1h Breakdown ✅ (close {close:.6f} unter {lvl:.6f})", lvl
+        return False, f"1h Breakdown warten (close {close:.6f} noch nicht unter {lvl:.6f})", lvl
 
     return False, "Invalid side", None
 
@@ -768,3 +768,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
