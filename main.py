@@ -29,32 +29,32 @@ RSI_LEN  = 14
 
 VOL_MA_LEN = 20
 
-# NEW: dynamic volume thresholds (quality, but realistic)
-VOL_RATIO_MIN_BREAK  = 1.10   # breakout/breakdown needs more volume
-VOL_RATIO_MIN_RETEST = 1.00   # retest can be ok at ~avg volume
-
-# If candle is very strong we allow a tiny relaxation (still quality)
-VOL_STRONG_CANDLE_DISCOUNT = 0.05  # e.g. 1.10 -> 1.05
-
+# dynamic volume thresholds (quality, but realistic)
+VOL_RATIO_MIN_BREAK  = 1.10
+VOL_RATIO_MIN_RETEST = 1.00
+VOL_STRONG_CANDLE_DISCOUNT = 0.05
 VOL_RATIO_IF_RSI_EXCEPTION = 1.30
 
 ATR_LEN = 14
 ATR_MULT = 1.5
 
-# Candle strength (break/retest confirmation)
-MIN_BODY_TO_RANGE = 0.55
+# ===== Candle strength (BREAK only) =====
+# was 0.55 -> too strict; keep quality but allow more real setups
+MIN_BODY_TO_RANGE_BREAK = 0.45
+# ATR exception: if candle range is big, body can be smaller
+MIN_BODY_TO_RANGE_BREAK_IF_BIG_RANGE = 0.33
+BIG_RANGE_ATR_MULT = 1.10
+
 MIN_RANGE_ATR_MULT = 0.70
 
 # Retest quality
 RETEST_MIN_WICK_RATIO = 0.25
 RETEST_MAX_BODY_RATIO = 0.80
-
-# allow proximity to count as retest touch
-RETEST_PROX_PCT = 0.0010  # 0.10% of price
+RETEST_PROX_PCT = 0.0010
 
 # Micro trend softness
 MICRO_TREND_ENABLED = True
-EMA_ALIGN_TOL_PCT = 0.001        # 0.10%
+EMA_ALIGN_TOL_PCT = 0.001
 EMA_SLOPE_LEN = 3
 
 # RSI filters
@@ -83,7 +83,7 @@ ZONE_PAD_PCT_4H = 0.0012
 # ZONE FREEZE
 # =========================
 ZONE_FREEZE_ENABLED = True
-ZONE_FREEZE_CANDLES_15M = 8   # 8 * 15m = 2 hours
+ZONE_FREEZE_CANDLES_15M = 8  # 2 hours
 
 # =========================
 # Telegram env (both naming styles)
@@ -99,8 +99,6 @@ DELETE_BOT_MESSAGES_AT = "00:00"
 # Runtime
 LOOP_SLEEP_SECONDS = 25
 RATE_LIMIT_BACKOFF_SECONDS = 60
-
-DEBUG_LOGS = (os.getenv("DEBUG_LOGS") or "0").strip() in ("1", "true", "True")
 
 SYMBOLS = [
     "BTC/USDT",
@@ -278,29 +276,19 @@ def ema_slope_up(e: pd.Series, n: int = 3) -> bool:
 # =========================
 
 def robust_volma(vol: pd.Series, n: int = 20) -> float:
-    """
-    Robust VolMA:
-      - median protects against spikes
-      - mean keeps it responsive
-      We take max(median, mean*0.85) to avoid vma being inflated by one spike.
-    """
     w = vol.tail(n).astype(float)
     if len(w) < 3:
         return float(w.mean()) if len(w) else 0.0
-
     med = float(w.median())
-    mean = float(w.mean())
-    # damp mean slightly so one spike doesn't inflate too much
-    mean_damped = mean * 0.85
-
-    return max(med, mean_damped, 1e-12)
+    mean = float(w.mean()) * 0.85
+    return max(med, mean, 1e-12)
 
 
 # =========================
 # ZONES
 # =========================
 
-def _pivots(series: pd.Series, left: int, right: int, mode: str) -> List[Tuple[pd.Timestamp, float]]:
+def _pivots(series: pd.Series, left: int, right: int, mode: str):
     piv = []
     vals = series.values
     idx = series.index
@@ -315,7 +303,7 @@ def _pivots(series: pd.Series, left: int, right: int, mode: str) -> List[Tuple[p
                 piv.append((idx[i], float(vals[i])))
     return piv
 
-def best_pivot_zones(df: pd.DataFrame, current_price: float, lookback: int, pad_pct: float) -> Tuple[Optional["Zone"], Optional["Zone"]]:
+def best_pivot_zones(df: pd.DataFrame, current_price: float, lookback: int, pad_pct: float):
     if len(df) < lookback + 10:
         return None, None
 
@@ -374,14 +362,7 @@ class CacheItem:
     df: pd.DataFrame
     last_fetch: float
 
-def get_df_cached(
-    ex: ccxt.Exchange,
-    cache: Dict[Tuple[str, str], CacheItem],
-    symbol: str,
-    tf: str,
-    limit: int,
-    refresh_seconds: int
-) -> pd.DataFrame:
+def get_df_cached(ex, cache, symbol, tf, limit, refresh_seconds):
     key = (symbol, tf)
     now = time.time()
     item = cache.get(key)
@@ -406,7 +387,7 @@ def compute_bias(df: pd.DataFrame) -> Bias:
         return Bias("SHORT")
     return Bias("NEUTRAL")
 
-def is_break_event(side: str, close: float, sup: Optional["Zone"], res: Optional["Zone"]) -> Tuple[bool, str, Optional[float]]:
+def is_break_event(side: str, close: float, sup: Optional[Zone], res: Optional[Zone]):
     if side == "LONG":
         if not res:
             return False, "No 1h resistance zone", None
@@ -427,7 +408,53 @@ def is_break_event(side: str, close: float, sup: Optional["Zone"], res: Optional
 
     return False, "Invalid side", None
 
-def candle_strength_ok(row: pd.Series, atr_val: float) -> Tuple[bool, str]:
+def wick_metrics(o, h, l, c):
+    rng = max(h - l, 1e-12)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    body = abs(c - o)
+    return (upper_wick / rng, lower_wick / rng, body / rng, rng)
+
+def retest_event(side: str, row: pd.Series, sup: Optional[Zone], res: Optional[Zone], last_close: float):
+    o = float(row["open"]); h = float(row["high"]); l = float(row["low"]); c = float(row["close"])
+    up_w, lo_w, body_r, _ = wick_metrics(o, h, l, c)
+    prox = max(last_close * RETEST_PROX_PCT, 1e-12)
+
+    if side == "SHORT":
+        if not res:
+            return False, "No 1h resistance zone", None
+        near_or_touch = (h >= res.low) or (abs(res.low - h) <= prox) or (abs(res.low - c) <= prox)
+        not_breaking = c <= res.high
+        wick_ok = up_w >= RETEST_MIN_WICK_RATIO
+        body_ok = body_r <= RETEST_MAX_BODY_RATIO
+        bearish_or_small = (c <= o) or (body_r <= 0.35)
+        if near_or_touch and not_breaking and wick_ok and body_ok and bearish_or_small:
+            return True, f"1h Retest SHORT ✅ (Rejection an Resistance {fmt_zone(res)})", (res.low, res.high)
+        return False, "1h Retest SHORT warten", (res.low, res.high)
+
+    if side == "LONG":
+        if not sup:
+            return False, "No 1h support zone", None
+        near_or_touch = (l <= sup.high) or (abs(l - sup.high) <= prox) or (abs(c - sup.high) <= prox)
+        not_breaking = c >= sup.low
+        wick_ok = lo_w >= RETEST_MIN_WICK_RATIO
+        body_ok = body_r <= RETEST_MAX_BODY_RATIO
+        bullish_or_small = (c >= o) or (body_r <= 0.35)
+        if near_or_touch and not_breaking and wick_ok and body_ok and bullish_or_small:
+            return True, f"1h Retest LONG ✅ (Bounce an Support {fmt_zone(sup)})", (sup.low, sup.high)
+        return False, "1h Retest LONG warten", (sup.low, sup.high)
+
+    return False, "Invalid side", None
+
+def candle_strength_ok(row: pd.Series, atr_val: float, trigger_kind: str):
+    """
+    IMPORTANT CHANGE:
+    - RETEST: body filter OFF (retests are wick-dominant by nature)
+    - BREAK: body filter ON but softer + ATR range exception
+    """
+    if trigger_kind == "RETEST":
+        return True, "OK (RETEST: body filter disabled)"
+
     o = float(row["open"])
     h = float(row["high"])
     l = float(row["low"])
@@ -437,65 +464,19 @@ def candle_strength_ok(row: pd.Series, atr_val: float) -> Tuple[bool, str]:
     body = abs(c - o)
     body_ratio = body / rng
 
-    if body_ratio < MIN_BODY_TO_RANGE:
-        return False, f"Body too small ({body_ratio:.2f} < {MIN_BODY_TO_RANGE})"
+    # ATR exception
+    if atr_val and atr_val > 0 and rng >= atr_val * BIG_RANGE_ATR_MULT:
+        if body_ratio < MIN_BODY_TO_RANGE_BREAK_IF_BIG_RANGE:
+            return False, f"Body too small even for big-range break ({body_ratio:.2f} < {MIN_BODY_TO_RANGE_BREAK_IF_BIG_RANGE})"
+    else:
+        if body_ratio < MIN_BODY_TO_RANGE_BREAK:
+            return False, f"Body too small ({body_ratio:.2f} < {MIN_BODY_TO_RANGE_BREAK})"
 
     if atr_val and atr_val > 0:
         if rng < atr_val * MIN_RANGE_ATR_MULT:
             return False, "Range too small vs ATR"
 
     return True, "OK"
-
-def wick_metrics(o: float, h: float, l: float, c: float) -> Tuple[float, float, float, float]:
-    rng = max(h - l, 1e-12)
-    upper_wick = h - max(o, c)
-    lower_wick = min(o, c) - l
-    body = abs(c - o)
-    return (upper_wick / rng, lower_wick / rng, body / rng, rng)
-
-def retest_event(
-    side: str,
-    row: pd.Series,
-    sup: Optional[Zone],
-    res: Optional[Zone],
-    last_close: float
-) -> Tuple[bool, str, Optional[Tuple[float, float]]]:
-    o = float(row["open"]); h = float(row["high"]); l = float(row["low"]); c = float(row["close"])
-    up_w, lo_w, body_r, _ = wick_metrics(o, h, l, c)
-
-    prox = max(last_close * RETEST_PROX_PCT, 1e-12)
-
-    if side == "SHORT":
-        if not res:
-            return False, "No 1h resistance zone", None
-
-        near_or_touch = (h >= res.low) or (abs(res.low - h) <= prox) or (abs(res.low - c) <= prox)
-        not_breaking = c <= res.high
-        wick_ok = up_w >= RETEST_MIN_WICK_RATIO
-        body_ok = body_r <= RETEST_MAX_BODY_RATIO
-        bearish_or_small = (c <= o) or (body_r <= 0.35)
-
-        if near_or_touch and not_breaking and wick_ok and body_ok and bearish_or_small:
-            return True, f"1h Retest SHORT ✅ (Rejection an Resistance {fmt_zone(res)})", (res.low, res.high)
-
-        return False, "1h Retest SHORT warten", (res.low, res.high)
-
-    if side == "LONG":
-        if not sup:
-            return False, "No 1h support zone", None
-
-        near_or_touch = (l <= sup.high) or (abs(l - sup.high) <= prox) or (abs(c - sup.high) <= prox)
-        not_breaking = c >= sup.low
-        wick_ok = lo_w >= RETEST_MIN_WICK_RATIO
-        body_ok = body_r <= RETEST_MAX_BODY_RATIO
-        bullish_or_small = (c >= o) or (body_r <= 0.35)
-
-        if near_or_touch and not_breaking and wick_ok and body_ok and bullish_or_small:
-            return True, f"1h Retest LONG ✅ (Bounce an Support {fmt_zone(sup)})", (sup.low, sup.high)
-
-        return False, "1h Retest LONG warten", (sup.low, sup.high)
-
-    return False, "Invalid side", None
 
 def entry_filters_quality(
     side: str,
@@ -506,10 +487,9 @@ def entry_filters_quality(
     r15: float,
     r15_prev: float,
     vol_ratio: float,
-    trigger_kind: str,  # "BREAK" or "RETEST"
+    trigger_kind: str,
     strong_candle: bool
-) -> Tuple[bool, str]:
-    # dynamic vol threshold
+):
     base_thr = VOL_RATIO_MIN_BREAK if trigger_kind == "BREAK" else VOL_RATIO_MIN_RETEST
     if strong_candle:
         base_thr = max(0.90, base_thr - VOL_STRONG_CANDLE_DISCOUNT)
@@ -529,7 +509,6 @@ def entry_filters_quality(
             return False, "15m not bearish yet (waiting pullback to finish)"
 
         if r15 < RSI_SHORT_MIN:
-            # for BREAK we can still allow, but only with strong volume
             if trigger_kind != "BREAK":
                 return False, f"RSI too low for SHORT ({r15:.2f} < {RSI_SHORT_MIN})"
             if vol_ratio < VOL_RATIO_IF_RSI_EXCEPTION:
@@ -562,16 +541,16 @@ def entry_filters_quality(
 # RISK / MESSAGE
 # =========================
 
-def entry_range_from_price(px: float) -> Tuple[float, float]:
+def entry_range_from_price(px: float):
     low = px * (1 - ENTRY_PAD_PCT)
     high = px * (1 + ENTRY_PAD_PCT)
     return float(low), float(high)
 
-def pullback_zone(level: float) -> Tuple[float, float]:
+def pullback_zone(level: float):
     pad = level * PULLBACK_PAD_PCT
     return float(level - pad), float(level + pad)
 
-def build_plan_by_riskdist(side: str, entry: float, risk_dist: float) -> Dict:
+def build_plan_by_riskdist(side: str, entry: float, risk_dist: float):
     cap_dist = entry * MAX_SL_PCT
     risk_dist = min(risk_dist, cap_dist)
     if side == "SHORT":
@@ -589,11 +568,11 @@ def build_plan_by_riskdist(side: str, entry: float, risk_dist: float) -> Dict:
         "crv": "1:2",
     }
 
-def build_plan(side: str, entry_price: float, atr_val: float) -> Dict:
+def build_plan(side: str, entry_price: float, atr_val: float):
     atr_dist = atr_val * ATR_MULT if atr_val and atr_val > 0 else entry_price * 0.005
     return build_plan_by_riskdist(side, entry_price, atr_dist)
 
-def build_retest_plan(side: str, entry_price: float, zone_low: float, zone_high: float, atr_val: float) -> Dict:
+def build_retest_plan(side: str, entry_price: float, zone_low: float, zone_high: float, atr_val: float):
     buffer = (zone_high - zone_low) * 0.25
     if buffer <= 0:
         buffer = entry_price * 0.0015
@@ -610,7 +589,7 @@ def build_setup_message(
     side: str,
     ts_close: pd.Timestamp,
     trigger_text: str,
-    trigger_kind: str,   # "BREAK" or "RETEST"
+    trigger_kind: str,
     break_level: Optional[float],
     safe_zone: Optional[Tuple[float, float]],
     breakout_row: pd.Series,
@@ -619,7 +598,7 @@ def build_setup_message(
     r15: float, r4h: float, r1d: float,
     vol_ratio: float,
     atrv: float
-) -> str:
+):
     side_u = side.upper()
     head = "🟢 <b>LONG</b>" if side_u == "LONG" else "🔴 <b>SHORT</b>"
 
@@ -685,12 +664,7 @@ class FrozenZones:
     res_1h: Optional[Zone]
     remaining_15m: int
 
-def maybe_update_frozen_zones(
-    frozen: Dict[str, FrozenZones],
-    symbol: str,
-    df1h: pd.DataFrame,
-    current_price: float
-) -> FrozenZones:
+def maybe_update_frozen_zones(frozen, symbol, df1h, current_price):
     if not ZONE_FREEZE_ENABLED:
         sup, res = best_pivot_zones(df1h, current_price=current_price, lookback=LOOKBACK_1H, pad_pct=ZONE_PAD_PCT_1H)
         return FrozenZones(sup, res, remaining_15m=0)
@@ -701,10 +675,9 @@ def maybe_update_frozen_zones(
         f = FrozenZones(sup, res, remaining_15m=ZONE_FREEZE_CANDLES_15M)
         frozen[symbol] = f
         return f
-
     return f
 
-def decrement_freeze(frozen: Dict[str, FrozenZones], symbol: str):
+def decrement_freeze(frozen, symbol):
     if not ZONE_FREEZE_ENABLED:
         return
     f = frozen.get(symbol)
@@ -785,7 +758,6 @@ def main():
                 e20v = float(e20_series.iloc[-1])
                 e50v = float(e50_series.iloc[-1])
 
-                # robust volume ratio
                 v = float(df15_closed["volume"].iloc[-1])
                 vma = robust_volma(df15_closed["volume"], VOL_MA_LEN)
                 vol_ratio = (v / vma) if (vma and vma > 0) else 0.0
@@ -823,7 +795,7 @@ def main():
                 trigger_text = break_reason if break_ok else ret_reason
                 safe_zone = None if break_ok else ret_safe_zone
 
-                strong_ok, strong_why = candle_strength_ok(trigger_row, atrv)
+                strong_ok, strong_why = candle_strength_ok(trigger_row, atrv, trigger_kind)
                 if not strong_ok:
                     print(f"[{symbol}] close={ts_close} bias={side} setup=NO ({strong_why}) rsi15={r15:.2f}", flush=True)
                     decrement_freeze(frozen_zones, symbol)
