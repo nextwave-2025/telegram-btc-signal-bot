@@ -29,13 +29,19 @@ RSI_LEN  = 14
 
 # Quality > quantity filters
 VOL_MA_LEN = 20
-VOL_RATIO_MIN_SETUP = 1.15       # breakout candle volume >= 1.15x VolMA
+VOL_RATIO_MIN_SETUP = 1.15
 VOL_RATIO_IF_RSI_EXCEPTION = 1.30
 
 ATR_LEN = 14
 ATR_MULT = 1.5
+
+# Candle strength (break/retest confirmation)
 MIN_BODY_TO_RANGE = 0.55
 MIN_RANGE_ATR_MULT = 0.70
+
+# Retest quality: wick rejection
+RETEST_MIN_WICK_RATIO = 0.35   # wick portion of range
+RETEST_MAX_BODY_RATIO = 0.75   # avoid huge full-body candles (often continuation; still ok but keep quality)
 
 # Micro trend softness (avoid being blocked by tiny EMA flips)
 MICRO_TREND_ENABLED = True
@@ -67,9 +73,8 @@ ZONE_PAD_PCT_4H = 0.0012
 # =========================
 # ZONE FREEZE
 # =========================
-# Freeze 1h zones for N processed 15m closes
 ZONE_FREEZE_ENABLED = True
-ZONE_FREEZE_CANDLES_15M = 8   # 8 * 15m = 2 hours (stabiler Trigger)
+ZONE_FREEZE_CANDLES_15M = 8   # 8 * 15m = 2 hours
 
 # =========================
 # Telegram env (both naming styles)
@@ -307,14 +312,13 @@ def best_pivot_zones(df: pd.DataFrame, current_price: float, lookback: int, pad_
 def fmt_zone(z: Optional[Zone]) -> str:
     if not z:
         return "—"
-    # show less decimals for big prices
     if z.high >= 1000:
         return f"{z.low:.2f}–{z.high:.2f}"
     return f"{z.low:.6f}–{z.high:.6f}"
 
 
 # =========================
-# EXCHANGE / FETCH (with caching to reduce RateLimit)
+# EXCHANGE / FETCH (with caching)
 # =========================
 
 def to_bybit_linear(sym: str) -> str:
@@ -370,7 +374,7 @@ def compute_bias(df: pd.DataFrame) -> Bias:
         return Bias("SHORT")
     return Bias("NEUTRAL")
 
-# ✅ FIXED: clear log text even when break=NO
+# Breakout / Breakdown trigger (HTML safe text)
 def is_break_event(side: str, close: float, sup: Optional["Zone"], res: Optional["Zone"]) -> Tuple[bool, str, Optional[float]]:
     if side == "LONG":
         if not res:
@@ -407,9 +411,58 @@ def candle_strength_ok(row: pd.Series, atr_val: float) -> Tuple[bool, str]:
 
     if atr_val and atr_val > 0:
         if rng < atr_val * MIN_RANGE_ATR_MULT:
-            return False, f"Range too small vs ATR ({rng:.6f} < {MIN_RANGE_ATR_MULT}xATR)"
+            return False, "Range too small vs ATR"
 
     return True, "OK"
+
+def wick_metrics(o: float, h: float, l: float, c: float) -> Tuple[float, float, float, float]:
+    rng = max(h - l, 1e-12)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    body = abs(c - o)
+    return (upper_wick / rng, lower_wick / rng, body / rng, rng)
+
+def retest_event(
+    side: str,
+    row: pd.Series,
+    sup: Optional[Zone],
+    res: Optional[Zone]
+) -> Tuple[bool, str, Optional[Tuple[float, float]]]:
+    """
+    Retest idea:
+      SHORT: price wicks into 1h resistance zone, then closes back below zone.low (rejection)
+      LONG : price wicks into 1h support zone, then closes back above zone.high (bounce)
+    Returns:
+      ok, reason, safe_zone_range (low, high) -> the zone itself as safe entry
+    """
+    o = float(row["open"]); h = float(row["high"]); l = float(row["low"]); c = float(row["close"])
+    up_w, lo_w, body_r, _ = wick_metrics(o, h, l, c)
+
+    if side == "SHORT":
+        if not res:
+            return False, "No 1h resistance zone", None
+        touched = h >= res.low
+        rejected = c < res.low  # closes back below zone
+        bearish = c <= o
+        wick_ok = up_w >= RETEST_MIN_WICK_RATIO
+        body_ok = body_r <= RETEST_MAX_BODY_RATIO
+        if touched and rejected and bearish and wick_ok and body_ok:
+            return True, f"1h Retest SHORT ✅ (Rejection an Resistance {fmt_zone(res)})", (res.low, res.high)
+        return False, "1h Retest SHORT warten", (res.low, res.high)
+
+    if side == "LONG":
+        if not sup:
+            return False, "No 1h support zone", None
+        touched = l <= sup.high
+        bounced = c > sup.high  # closes back above zone
+        bullish = c >= o
+        wick_ok = lo_w >= RETEST_MIN_WICK_RATIO
+        body_ok = body_r <= RETEST_MAX_BODY_RATIO
+        if touched and bounced and bullish and wick_ok and body_ok:
+            return True, f"1h Retest LONG ✅ (Bounce an Support {fmt_zone(sup)})", (sup.low, sup.high)
+        return False, "1h Retest LONG warten", (sup.low, sup.high)
+
+    return False, "Invalid side", None
 
 def entry_filters_quality(
     side: str,
@@ -421,7 +474,7 @@ def entry_filters_quality(
     r15_prev: float,
     v: float,
     vma: float,
-    break_event: bool
+    trigger_is_break: bool
 ) -> Tuple[bool, str]:
     vol_ratio = (v / vma) if (vma and vma > 0) else 0.0
     if vol_ratio < VOL_RATIO_MIN_SETUP:
@@ -439,7 +492,8 @@ def entry_filters_quality(
             return False, "15m not bearish yet (waiting pullback to finish)"
 
         if r15 < RSI_SHORT_MIN:
-            if not break_event:
+            # allow exception only if it is an actual BREAK trigger with strong volume
+            if not trigger_is_break:
                 return False, f"RSI too low for SHORT ({r15:.2f} < {RSI_SHORT_MIN})"
             if vol_ratio < VOL_RATIO_IF_RSI_EXCEPTION:
                 return False, f"RSI low; need stronger volume ({vol_ratio:.2f}x < {VOL_RATIO_IF_RSI_EXCEPTION:.2f}x)"
@@ -471,43 +525,59 @@ def entry_filters_quality(
 # RISK / MESSAGE
 # =========================
 
-def build_plan(side: str, entry_price: float, atr_val: float) -> Dict:
-    atr_dist = atr_val * ATR_MULT if atr_val and atr_val > 0 else entry_price * 0.005
-    cap_dist = entry_price * MAX_SL_PCT
-    risk_dist = min(atr_dist, cap_dist)
-
-    if side.upper() == "SHORT":
-        sl = entry_price + risk_dist
-        tps = [entry_price - risk_dist * rr for rr in RR_TARGETS]
-    else:
-        sl = entry_price - risk_dist
-        tps = [entry_price + risk_dist * rr for rr in RR_TARGETS]
-
-    return {
-        "sl": float(sl),
-        "tp1": float(tps[0]),
-        "tp2": float(tps[1]),
-        "tp3": float(tps[2]),
-        "risk_pct": float((risk_dist / entry_price) * 100.0),
-        "crv": "1:2",
-    }
-
-def pullback_zone(break_level: float) -> Tuple[float, float]:
-    pad = break_level * PULLBACK_PAD_PCT
-    return float(break_level - pad), float(break_level + pad)
-
 def entry_range_from_price(px: float) -> Tuple[float, float]:
     low = px * (1 - ENTRY_PAD_PCT)
     high = px * (1 + ENTRY_PAD_PCT)
     return float(low), float(high)
 
+def pullback_zone(level: float) -> Tuple[float, float]:
+    pad = level * PULLBACK_PAD_PCT
+    return float(level - pad), float(level + pad)
+
+def build_plan_by_riskdist(side: str, entry: float, risk_dist: float) -> Dict:
+    cap_dist = entry * MAX_SL_PCT
+    risk_dist = min(risk_dist, cap_dist)
+    if side == "SHORT":
+        sl = entry + risk_dist
+        tps = [entry - risk_dist * rr for rr in RR_TARGETS]
+    else:
+        sl = entry - risk_dist
+        tps = [entry + risk_dist * rr for rr in RR_TARGETS]
+    return {
+        "sl": float(sl),
+        "tp1": float(tps[0]),
+        "tp2": float(tps[1]),
+        "tp3": float(tps[2]),
+        "risk_pct": float((risk_dist / entry) * 100.0),
+        "crv": "1:2",
+    }
+
+def build_plan(side: str, entry_price: float, atr_val: float) -> Dict:
+    atr_dist = atr_val * ATR_MULT if atr_val and atr_val > 0 else entry_price * 0.005
+    return build_plan_by_riskdist(side, entry_price, atr_dist)
+
+def build_retest_plan(side: str, entry_price: float, zone_low: float, zone_high: float, atr_val: float) -> Dict:
+    buffer = (zone_high - zone_low) * 0.25
+    if buffer <= 0:
+        buffer = entry_price * 0.0015
+
+    if side == "SHORT":
+        # SL above zone high + buffer (but cap at 2%)
+        desired_dist = max((zone_high + buffer) - entry_price, atr_val * 0.9 if atr_val else entry_price * 0.004)
+    else:
+        desired_dist = max(entry_price - (zone_low - buffer), atr_val * 0.9 if atr_val else entry_price * 0.004)
+
+    return build_plan_by_riskdist(side, entry_price, desired_dist)
+
 def build_setup_message(
     symbol: str,
     side: str,
     ts_close: pd.Timestamp,
+    trigger_text: str,
+    trigger_kind: str,   # "BREAK" or "RETEST"
+    break_level: Optional[float],
+    safe_zone: Optional[Tuple[float, float]],
     breakout_row: pd.Series,
-    break_reason: str,
-    break_level: float,
     sup_1h: Optional[Zone], res_1h: Optional[Zone],
     sup_4h: Optional[Zone], res_4h: Optional[Zone],
     r15: float, r4h: float, r1d: float,
@@ -518,33 +588,44 @@ def build_setup_message(
     head = "🟢 <b>LONG</b>" if side_u == "LONG" else "🔴 <b>SHORT</b>"
 
     c = float(breakout_row["close"])
-
-    # Aggressive entry = breakout close (now)
-    aggressive_entry = c
-    ag_plan = build_plan(side_u, aggressive_entry, atrv)
-
-    # Safe entry = pullback zone around break_level
-    pb_low, pb_high = pullback_zone(break_level)
-    safe_entry_mid = (pb_low + pb_high) / 2.0
-    safe_plan = build_plan(side_u, safe_entry_mid, atrv)
-
     pair = symbol.replace(":USDT", "").replace("/", "")
     t_local = to_local_str(ts_close)
 
+    # Aggressive entry = current close
+    aggressive_entry = c
     ag_low, ag_high = entry_range_from_price(aggressive_entry)
+
+    # Safe entry:
+    # - BREAK: pullback around break_level
+    # - RETEST: the 1h zone itself (support/resistance zone)
+    if trigger_kind == "BREAK" and break_level is not None:
+        pb_low, pb_high = pullback_zone(break_level)
+        safe_label = f"{pb_low:.6f} – {pb_high:.6f}"
+        safe_mid = (pb_low + pb_high) / 2.0
+        safe_plan = build_plan(side_u, safe_mid, atrv)
+    else:
+        if safe_zone is None:
+            safe_zone = (aggressive_entry * 0.999, aggressive_entry * 1.001)
+        z_low, z_high = safe_zone
+        safe_label = f"{z_low:.6f} – {z_high:.6f}"
+        safe_mid = (z_low + z_high) / 2.0
+        safe_plan = build_retest_plan(side_u, safe_mid, z_low, z_high, atrv)
+
+    # Aggressive plan: use ATR
+    ag_plan = build_plan(side_u, aggressive_entry, atrv)
 
     return (
         f"{head} <b>SETUP</b>\n\n"
         f"📊 <b>Pair:</b> {pair}\n"
         f"🕒 <b>Zeit (15m Close):</b> {t_local}\n"
-        f"📌 <b>Trigger:</b> {break_reason}\n\n"
+        f"📌 <b>Trigger:</b> {trigger_text}\n\n"
         f"🚀 <b>Aggressiver Entry (sofort):</b> {aggressive_entry:.6f}\n"
         f"   Range: {ag_low:.6f} – {ag_high:.6f}\n"
         f"   🛑 SL: {ag_plan['sl']:.6f} (Risk {ag_plan['risk_pct']:.2f}%, max {MAX_SL_PCT*100:.0f}%)\n"
         f"   ✅ TP1: {ag_plan['tp1']:.6f}\n"
         f"   ✅ TP2: {ag_plan['tp2']:.6f}  (<b>CRV 1:2</b>)\n"
         f"   ✅ TP3: {ag_plan['tp3']:.6f}\n\n"
-        f"🧲 <b>Sicherer Entry (Pullback-Zone):</b> {pb_low:.6f} – {pb_high:.6f}\n"
+        f"🧲 <b>Sicherer Entry (Zone):</b> {safe_label}\n"
         f"   Gültig für die nächsten <b>{PULLBACK_VALID_CANDLES}</b> Kerzen (~{PULLBACK_VALID_CANDLES*15} Min)\n"
         f"   🛑 SL: {safe_plan['sl']:.6f} (Risk {safe_plan['risk_pct']:.2f}%, max {MAX_SL_PCT*100:.0f}%)\n"
         f"   ✅ TP1: {safe_plan['tp1']:.6f}\n"
@@ -590,7 +671,6 @@ def maybe_update_frozen_zones(
         frozen[symbol] = f
         return f
 
-    # still frozen
     return f
 
 def decrement_freeze(frozen: Dict[str, FrozenZones], symbol: str):
@@ -618,7 +698,7 @@ def main():
 
     print(
         f"✅ BOT AKTIV – ZoneFreeze={'ON' if ZONE_FREEZE_ENABLED else 'OFF'}({ZONE_FREEZE_CANDLES_15M}x15m) | "
-        f"Bias=4h | Trigger=1hZones+15mBreak | MicroTrend={'ON' if MICRO_TREND_ENABLED else 'OFF'} | "
+        f"Bias=4h | Trigger=1hBreak OR 1hRetest | MicroTrend={'ON' if MICRO_TREND_ENABLED else 'OFF'} | "
         f"Telegram={'ON' if telegram_enabled() else 'OFF'}",
         flush=True
     )
@@ -643,9 +723,8 @@ def main():
             maybe_midnight_cleanup(alert_state, sent_bot_message_ids)
 
             for symbol in symbols:
-                # 15m often
-                df15_raw = get_df_cached(ex, df_cache, symbol, TF_ENTRY, limit=340, refresh_seconds=refresh_15m)
-                if len(df15_raw) < 140:
+                df15_raw = get_df_cached(ex, df_cache, symbol, TF_ENTRY, limit=360, refresh_seconds=refresh_15m)
+                if len(df15_raw) < 160:
                     continue
 
                 # last closed 15m candle
@@ -657,12 +736,12 @@ def main():
                 df15_closed = df15_raw.iloc[:-1].copy()
                 last_close = float(df15_closed["close"].iloc[-1])
 
-                # higher TF less often
-                df1h = get_df_cached(ex, df_cache, symbol, TF_ZONES, limit=280, refresh_seconds=refresh_1h)
-                df4h = get_df_cached(ex, df_cache, symbol, TF_BIAS,  limit=260, refresh_seconds=refresh_4h)
-                df1d = get_df_cached(ex, df_cache, symbol, TF_DAILY, limit=220, refresh_seconds=refresh_1d)
+                df1h = get_df_cached(ex, df_cache, symbol, TF_ZONES, limit=300, refresh_seconds=refresh_1h)
+                df4h = get_df_cached(ex, df_cache, symbol, TF_BIAS,  limit=280, refresh_seconds=refresh_4h)
+                df1d = get_df_cached(ex, df_cache, symbol, TF_DAILY, limit=240, refresh_seconds=refresh_1d)
 
-                if len(df1h) < 150 or len(df4h) < 150 or len(df1d) < 100:
+                if len(df1h) < 160 or len(df4h) < 160 or len(df1d) < 120:
+                    decrement_freeze(frozen_zones, symbol)
                     continue
 
                 # indicators
@@ -701,43 +780,58 @@ def main():
                 sup_1h, res_1h = fz.sup_1h, fz.res_1h
                 sup_4h, res_4h = best_pivot_zones(df4h, current_price=last_close, lookback=LOOKBACK_4H, pad_pct=ZONE_PAD_PCT_4H)
 
-                # break event (✅ fixed messaging)
+                # trigger candle (last closed)
+                trigger_row = df15_raw.iloc[-2]
+
+                # 1) BREAK trigger
                 break_ok, break_reason, break_level = is_break_event(side, last_close, sup_1h, res_1h)
-                if not break_ok or break_level is None:
-                    print(f"[{symbol}] close={ts_close} bias={side} break=NO ({break_reason}) rsi15={r15:.2f}", flush=True)
+
+                # 2) RETEST trigger (only if break not ok)
+                ret_ok, ret_reason, ret_safe_zone = retest_event(side, trigger_row, sup_1h, res_1h)
+
+                if not break_ok and not ret_ok:
+                    # log both statuses compact
+                    if side == "SHORT":
+                        print(f"[{symbol}] close={ts_close} bias=SHORT trigger=NO (break: {break_reason} | retest: {ret_reason}) rsi15={r15:.2f}", flush=True)
+                    else:
+                        print(f"[{symbol}] close={ts_close} bias=LONG  trigger=NO (break: {break_reason} | retest: {ret_reason}) rsi15={r15:.2f}", flush=True)
                     decrement_freeze(frozen_zones, symbol)
                     continue
 
-                # quality filters
+                trigger_kind = "BREAK" if break_ok else "RETEST"
+                trigger_text = break_reason if break_ok else ret_reason
+                safe_zone = None if break_ok else ret_safe_zone
+
+                # quality filters (note: we only allow RSI-short exception for BREAK)
                 ok, why = entry_filters_quality(
                     side, last_close,
                     e20v, e50v,
                     e20_series,
                     r15, r15_prev,
                     v, vma,
-                    break_ok
+                    trigger_is_break=bool(break_ok)
                 )
                 if not ok:
                     print(f"[{symbol}] close={ts_close} bias={side} setup=NO ({why}) rsi15={r15:.2f}", flush=True)
                     decrement_freeze(frozen_zones, symbol)
                     continue
 
-                # breakout candle strength
-                breakout_row = df15_raw.iloc[-2]
-                strong_ok, strong_why = candle_strength_ok(breakout_row, atrv)
+                # candle strength confirmation
+                strong_ok, strong_why = candle_strength_ok(trigger_row, atrv)
                 if not strong_ok:
                     print(f"[{symbol}] close={ts_close} bias={side} setup=NO ({strong_why}) rsi15={r15:.2f}", flush=True)
                     decrement_freeze(frozen_zones, symbol)
                     continue
 
-                # send ONE message containing aggressive + safe entries
                 msg = build_setup_message(
                     symbol=symbol,
                     side=side,
                     ts_close=ts_close,
-                    breakout_row=breakout_row,
-                    break_reason=break_reason,
-                    break_level=break_level,
+                    trigger_text=trigger_text,
+                    trigger_kind=trigger_kind,
+                    break_level=break_level if break_ok else None,
+                    safe_zone=safe_zone,
+                    breakout_row=trigger_row,
                     sup_1h=sup_1h, res_1h=res_1h,
                     sup_4h=sup_4h, res_4h=res_4h,
                     r15=r15, r4h=r4h, r1d=r1d,
@@ -750,11 +844,8 @@ def main():
                 if mid:
                     sent_bot_message_ids.append(mid)
 
-                # after a setup, keep zone frozen (don’t decrement immediately)
-                # but still decrement once per processed candle:
                 decrement_freeze(frozen_zones, symbol)
-
-                time.sleep(0.15)
+                time.sleep(0.12)
 
             time.sleep(LOOP_SLEEP_SECONDS)
 
@@ -768,4 +859,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
